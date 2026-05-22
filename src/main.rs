@@ -4,6 +4,7 @@ use std::{
     env,
     io::{self, Stdout},
     process::{Command, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -48,6 +49,16 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     refresh_seconds: u64,
 
+    /// Number of pane captures taken at startup to detect which windows are still
+    /// producing output. 1 disables activity detection at startup; the marker
+    /// then only becomes accurate after the first auto-refresh.
+    #[arg(long, default_value_t = DEFAULT_ACTIVITY_SAMPLES)]
+    activity_samples: usize,
+
+    /// Milliseconds between activity samples at startup.
+    #[arg(long, default_value_t = DEFAULT_ACTIVITY_INTERVAL_MS)]
+    activity_interval_ms: u64,
+
     /// Print targets and exit without opening the picker.
     #[arg(long)]
     list: bool,
@@ -59,22 +70,29 @@ struct Options {
     preview_lines: usize,
     inline_lines: usize,
     refresh_seconds: u64,
+    activity_samples: usize,
+    activity_interval: Duration,
 }
 
 impl Cli {
     fn options(&self) -> Options {
+        let activity_interval = Duration::from_millis(self.activity_interval_ms);
         match self.window_lines {
             Some(lines) => Options {
                 all_windows: true,
                 preview_lines: lines,
                 inline_lines: 0,
                 refresh_seconds: self.refresh_seconds,
+                activity_samples: self.activity_samples,
+                activity_interval,
             },
             None => Options {
                 all_windows: self.all_windows,
                 preview_lines: self.preview_lines,
                 inline_lines: self.inline_lines,
                 refresh_seconds: self.refresh_seconds,
+                activity_samples: self.activity_samples,
+                activity_interval,
             },
         }
     }
@@ -93,7 +111,20 @@ struct Entry {
     pane_id: String,
     pane_current_path: String,
     preview: Vec<String>,
+    activity: Activity,
+    activity_fingerprint: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Activity {
+    #[default]
+    Unknown,
+    Idle,
+    Active,
+}
+
+const DEFAULT_ACTIVITY_SAMPLES: usize = 4;
+const DEFAULT_ACTIVITY_INTERVAL_MS: u64 = 300;
 
 #[derive(Debug, Clone, Default)]
 struct CurrentTarget {
@@ -126,7 +157,13 @@ struct App {
 impl App {
     fn load(options: Options) -> Result<Self> {
         let current = current_target();
-        let entries = load_entries(true, options.preview_lines)?;
+        let mut entries = load_entries(true, options.preview_lines)?;
+        probe_initial_activity(
+            &mut entries,
+            options.preview_lines,
+            options.activity_samples,
+            options.activity_interval,
+        );
         let sessions = group_sessions(&entries);
         let (selected_session, selected_window) = initial_position(&sessions, &entries, &current);
         Ok(Self {
@@ -156,9 +193,15 @@ impl App {
             .get(self.selected_session)
             .map(|s| s.id.clone());
         let prev_window_id = self.selected_entry().map(|e| e.window_id.clone());
+        let prev_fingerprints: HashMap<String, String> = self
+            .entries
+            .iter()
+            .map(|e| (e.pane_id.clone(), e.activity_fingerprint.clone()))
+            .collect();
 
         match load_entries(true, self.preview_lines) {
-            Ok(entries) => {
+            Ok(mut entries) => {
+                apply_activity(&mut entries, &prev_fingerprints);
                 let sessions = group_sessions(&entries);
                 self.entries = entries;
                 self.sessions = sessions;
@@ -520,8 +563,13 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let session_count = app.sessions.len();
     let window_count: usize = app.sessions.iter().map(|s| s.window_indices.len()).sum();
+    let running_count = app
+        .entries
+        .iter()
+        .filter(|e| e.activity == Activity::Active)
+        .count();
     let summary = Span::styled(
-        format!("{session_count} sessions · {window_count} windows"),
+        format!("{session_count} sessions · {window_count} windows · {running_count} running"),
         Style::default().fg(Color::Cyan),
     );
     let current_session = app
@@ -623,12 +671,17 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     let current = is_current(entry, &app.current);
+    let active_output = entry.activity == Activity::Active;
+
     let mut flags = Vec::new();
     if current {
         flags.push("here");
     }
+    if active_output {
+        flags.push("running");
+    }
     if entry.window_active {
-        flags.push("active");
+        flags.push("focused");
     }
     let flags = if flags.is_empty() {
         String::new()
@@ -636,25 +689,44 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         format!("  {}", flags.join(","))
     };
 
-    let marker = if current { "● " } else { "  " };
-    let marker_style = if current {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
+    let current_marker = if current {
+        Span::styled(
+            "●",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Style::default().fg(Color::DarkGray)
+        Span::raw(" ")
+    };
+    let activity_marker = if active_output {
+        Span::styled(
+            "▸",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(" ")
     };
 
     let name_style = if current {
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD)
+    } else if active_output {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
 
     let mut lines = vec![Line::from(vec![
-        Span::styled(marker, marker_style),
+        current_marker,
+        Span::raw(" "),
+        activity_marker,
+        Span::raw(" "),
         Span::styled(
             format!("{:>3}: ", entry.window_index),
             Style::default().fg(Color::DarkGray),
@@ -736,6 +808,7 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
             continue;
         }
         let preview = capture_preview(&row.pane_id, preview_lines);
+        let activity_fingerprint = activity_fingerprint_of(&preview);
         entries.push(Entry {
             session_id: row.session_id,
             session_name: row.session_name,
@@ -748,6 +821,8 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
             pane_id: row.pane_id,
             pane_current_path: row.pane_current_path,
             preview,
+            activity: Activity::Unknown,
+            activity_fingerprint,
         });
     }
 
@@ -815,6 +890,85 @@ fn capture_preview(pane_id: &str, lines: usize) -> Vec<String> {
     match tmux_output(["capture-pane", "-p", "-J", "-t", pane_id, "-S", &start]) {
         Ok(output) => output.lines().map(clean_line).collect(),
         Err(err) => vec![format!("failed to capture pane: {err:#}")],
+    }
+}
+
+/// Fingerprint a pane's captured content for activity detection. Uses the full
+/// joined preview (trailing whitespace stripped) so a change anywhere in the
+/// visible region — not just at the cursor — counts as activity.
+fn activity_fingerprint_of(preview: &[String]) -> String {
+    let mut acc = String::new();
+    for line in preview {
+        if !acc.is_empty() {
+            acc.push('\n');
+        }
+        acc.push_str(line);
+    }
+    acc.trim_end().to_string()
+}
+
+/// Compare each entry's current fingerprint against a baseline (typically the
+/// fingerprint from the previous capture). Differing → `Active`, matching →
+/// `Idle`, missing baseline → `Unknown`.
+fn apply_activity(entries: &mut [Entry], baseline: &HashMap<String, String>) {
+    for entry in entries {
+        entry.activity = match baseline.get(&entry.pane_id) {
+            Some(prev) if *prev != entry.activity_fingerprint => Activity::Active,
+            Some(_) => Activity::Idle,
+            None => Activity::Unknown,
+        };
+    }
+}
+
+/// Probe each pane multiple times at startup, `interval` apart. A pane is
+/// marked `Active` if any consecutive pair of samples differs — catches
+/// bursty output that a single short window might miss.
+fn probe_initial_activity(
+    entries: &mut [Entry],
+    preview_lines: usize,
+    samples: usize,
+    interval: Duration,
+) {
+    if entries.is_empty() || samples < 2 {
+        // Single-sample case: leave activity as `Unknown` so the first
+        // auto-refresh establishes a baseline against the second sample.
+        return;
+    }
+
+    // Track whether any consecutive pair of samples differed per pane.
+    let mut any_change: HashMap<String, bool> = entries
+        .iter()
+        .map(|e| (e.pane_id.clone(), false))
+        .collect();
+    // Initial fingerprints are already in `entries` from load_entries.
+    let mut prev: HashMap<String, String> = entries
+        .iter()
+        .map(|e| (e.pane_id.clone(), e.activity_fingerprint.clone()))
+        .collect();
+
+    for _ in 1..samples {
+        thread::sleep(interval);
+        for entry in entries.iter_mut() {
+            entry.preview = capture_preview(&entry.pane_id, preview_lines);
+            entry.activity_fingerprint = activity_fingerprint_of(&entry.preview);
+
+            if let Some(prev_fp) = prev.get(&entry.pane_id) {
+                if *prev_fp != entry.activity_fingerprint {
+                    if let Some(flag) = any_change.get_mut(&entry.pane_id) {
+                        *flag = true;
+                    }
+                }
+            }
+            prev.insert(entry.pane_id.clone(), entry.activity_fingerprint.clone());
+        }
+    }
+
+    for entry in entries.iter_mut() {
+        entry.activity = if *any_change.get(&entry.pane_id).unwrap_or(&false) {
+            Activity::Active
+        } else {
+            Activity::Idle
+        };
     }
 }
 
@@ -1089,6 +1243,44 @@ mod tests {
             pane_id: format!("%{}-{}", session_id.trim_start_matches('$'), window_index),
             pane_current_path: "/tmp".to_string(),
             preview: Vec::new(),
+            activity: Activity::Unknown,
+            activity_fingerprint: String::new(),
         }
+    }
+
+    #[test]
+    fn activity_fingerprint_joins_preview_and_strips_trailing_whitespace() {
+        let preview = vec![
+            "abc".to_string(),
+            "def".to_string(),
+            "tail content here  ".to_string(),
+        ];
+        let fp = activity_fingerprint_of(&preview);
+        assert_eq!(fp, "abc\ndef\ntail content here");
+    }
+
+    #[test]
+    fn apply_activity_marks_changed_panes_as_active_and_stable_panes_as_idle() {
+        let mut entries = vec![
+            test_entry_with_fingerprint("$0", "0", "same"),
+            test_entry_with_fingerprint("$0", "1", "new output"),
+            test_entry_with_fingerprint("$1", "0", "no baseline"),
+        ];
+
+        let mut baseline = HashMap::new();
+        baseline.insert(entries[0].pane_id.clone(), "same".to_string());
+        baseline.insert(entries[1].pane_id.clone(), "old output".to_string());
+
+        apply_activity(&mut entries, &baseline);
+
+        assert_eq!(entries[0].activity, Activity::Idle);
+        assert_eq!(entries[1].activity, Activity::Active);
+        assert_eq!(entries[2].activity, Activity::Unknown);
+    }
+
+    fn test_entry_with_fingerprint(session_id: &str, window_index: &str, fp: &str) -> Entry {
+        let mut entry = test_entry(session_id, window_index, false);
+        entry.activity_fingerprint = fp.to_string();
+        entry
     }
 }
