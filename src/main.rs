@@ -2,7 +2,7 @@ use std::{
     cmp, env,
     io::{self, Stdout},
     process::{Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     inline_lines: usize,
 
+    /// Seconds between automatic refreshes while the picker is open. Use 0 to disable.
+    #[arg(long, default_value_t = 5)]
+    refresh_seconds: u64,
+
     /// Print targets and exit without opening the picker.
     #[arg(long)]
     list: bool,
@@ -52,6 +56,7 @@ struct Options {
     all_windows: bool,
     preview_lines: usize,
     inline_lines: usize,
+    refresh_seconds: u64,
 }
 
 impl Cli {
@@ -61,11 +66,13 @@ impl Cli {
                 all_windows: true,
                 preview_lines: lines,
                 inline_lines: lines,
+                refresh_seconds: self.refresh_seconds,
             },
             None => Options {
                 all_windows: self.all_windows,
                 preview_lines: self.preview_lines,
                 inline_lines: self.inline_lines,
+                refresh_seconds: self.refresh_seconds,
             },
         }
     }
@@ -99,6 +106,7 @@ struct App {
     preview_lines: usize,
     inline_lines: usize,
     all_windows: bool,
+    refresh_seconds: u64,
     current: CurrentTarget,
     status: Option<String>,
 }
@@ -113,18 +121,38 @@ impl App {
             preview_lines: options.preview_lines,
             inline_lines: options.inline_lines,
             all_windows: options.all_windows,
+            refresh_seconds: options.refresh_seconds,
             current,
             status: None,
         })
     }
 
     fn refresh(&mut self) {
+        self.refresh_with_status("refreshed");
+    }
+
+    fn auto_refresh(&mut self) {
+        self.refresh_with_status("auto refreshed");
+    }
+
+    fn refresh_with_status(&mut self, status: &str) {
+        let selected_pane = self.selected_entry().map(|entry| entry.pane_id.clone());
+        let selected_index = self.selected;
+
         match load_entries(self.all_windows, self.preview_lines) {
             Ok(entries) => {
                 self.entries = entries;
-                self.selected = cmp::min(self.selected, self.entries.len().saturating_sub(1));
+                self.selected = selected_pane
+                    .and_then(|pane_id| {
+                        self.entries
+                            .iter()
+                            .position(|entry| entry.pane_id == pane_id)
+                    })
+                    .unwrap_or_else(|| {
+                        cmp::min(selected_index, self.entries.len().saturating_sub(1))
+                    });
                 self.current = current_target();
-                self.status = Some("refreshed".to_string());
+                self.status = Some(status.to_string());
             }
             Err(err) => {
                 self.status = Some(format!("refresh failed: {err:#}"));
@@ -247,59 +275,92 @@ fn print_targets(options: Options) -> Result<()> {
 fn run_picker(options: Options) -> Result<Option<Entry>> {
     let mut app = App::load(options)?;
     let mut tui = Tui::new()?;
+    let refresh_interval = refresh_interval(options.refresh_seconds);
+    let mut last_refresh = Instant::now();
 
     loop {
         tui.draw(&app)?;
 
-        if !event::poll(Duration::from_millis(250)).context("poll terminal event")? {
-            continue;
+        if event::poll(poll_timeout(refresh_interval, last_refresh))
+            .context("poll terminal event")?
+        {
+            match event::read().context("read terminal event")? {
+                Event::Key(key) if should_quit(key) => return Ok(None),
+                Event::Key(key) if should_submit(key) => return Ok(app.selected_entry().cloned()),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('j'),
+                    ..
+                })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Char('J'),
+                    ..
+                })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                }) => app.next(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('k'),
+                    ..
+                })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Char('K'),
+                    ..
+                })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Up, ..
+                }) => app.previous(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                }) => app.page_down(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageUp,
+                    ..
+                }) => app.page_up(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('r'),
+                    ..
+                })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Char('R'),
+                    ..
+                }) => {
+                    app.refresh();
+                    last_refresh = Instant::now();
+                }
+                _ => {}
+            }
         }
 
-        match event::read().context("read terminal event")? {
-            Event::Key(key) if should_quit(key) => return Ok(None),
-            Event::Key(key) if should_submit(key) => return Ok(app.selected_entry().cloned()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('J'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Down,
-                ..
-            }) => app.next(),
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('K'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Up, ..
-            }) => app.previous(),
-            Event::Key(KeyEvent {
-                code: KeyCode::PageDown,
-                ..
-            }) => app.page_down(),
-            Event::Key(KeyEvent {
-                code: KeyCode::PageUp,
-                ..
-            }) => app.page_up(),
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('r'),
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('R'),
-                ..
-            }) => app.refresh(),
-            _ => {}
+        if refresh_due(refresh_interval, last_refresh) {
+            app.auto_refresh();
+            last_refresh = Instant::now();
         }
     }
+}
+
+fn refresh_interval(refresh_seconds: u64) -> Option<Duration> {
+    if refresh_seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(refresh_seconds))
+    }
+}
+
+fn poll_timeout(refresh_interval: Option<Duration>, last_refresh: Instant) -> Duration {
+    let max_poll = Duration::from_millis(250);
+    let Some(interval) = refresh_interval else {
+        return max_poll;
+    };
+
+    interval
+        .saturating_sub(last_refresh.elapsed())
+        .min(max_poll)
+}
+
+fn refresh_due(refresh_interval: Option<Duration>, last_refresh: Instant) -> bool {
+    refresh_interval.is_some_and(|interval| last_refresh.elapsed() >= interval)
 }
 
 fn should_quit(key: KeyEvent) -> bool {
@@ -353,7 +414,14 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw(format!("  {} entries", app.entries.len())),
     ]);
-    let help = Line::from("j/k move  enter switch  r refresh  q/esc quit");
+    let refresh = if app.refresh_seconds == 0 {
+        "auto off".to_string()
+    } else {
+        format!("auto {}s", app.refresh_seconds)
+    };
+    let help = Line::from(format!(
+        "j/k move  enter switch  r refresh  {refresh}  q/esc quit"
+    ));
     let paragraph = Paragraph::new(vec![title, help]).block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
@@ -667,12 +735,13 @@ mod tests {
 
     #[test]
     fn window_lines_enables_all_windows_and_sets_line_counts() {
-        let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "5"]).unwrap();
+        let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "10"]).unwrap();
         let options = cli.options();
 
         assert!(options.all_windows);
-        assert_eq!(options.preview_lines, 5);
-        assert_eq!(options.inline_lines, 5);
+        assert_eq!(options.preview_lines, 10);
+        assert_eq!(options.inline_lines, 10);
+        assert_eq!(options.refresh_seconds, 5);
     }
 
     #[test]
@@ -691,6 +760,33 @@ mod tests {
         assert!(options.all_windows);
         assert_eq!(options.preview_lines, 12);
         assert_eq!(options.inline_lines, 3);
+        assert_eq!(options.refresh_seconds, 5);
+    }
+
+    #[test]
+    fn refresh_seconds_can_disable_auto_refresh() {
+        let cli = Cli::try_parse_from([
+            "tmux-jump",
+            "--window-lines",
+            "10",
+            "--refresh-seconds",
+            "0",
+        ])
+        .unwrap();
+        let options = cli.options();
+
+        assert_eq!(options.refresh_seconds, 0);
+        assert_eq!(refresh_interval(options.refresh_seconds), None);
+    }
+
+    #[test]
+    fn refresh_due_respects_interval() {
+        assert!(refresh_due(
+            Some(Duration::from_secs(1)),
+            Instant::now() - Duration::from_secs(2)
+        ));
+        assert!(!refresh_due(Some(Duration::from_secs(5)), Instant::now()));
+        assert!(!refresh_due(None, Instant::now() - Duration::from_secs(10)));
     }
 
     #[test]
@@ -717,6 +813,7 @@ mod tests {
             preview_lines: 5,
             inline_lines: 5,
             all_windows: true,
+            refresh_seconds: 5,
             current: CurrentTarget::default(),
             status: None,
         };
