@@ -1,8 +1,10 @@
 use std::{
-    cmp, env,
+    cmp,
+    collections::HashMap,
+    env,
     io::{self, Stdout},
     process::{Command, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,9 +21,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-const SEP: char = '\x1f';
-const PANE_FORMAT: &str = "#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_activity}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_id}\x1f#{pane_active}\x1f#{pane_current_path}";
-const CURRENT_FORMAT: &str = "#{session_id}\x1f#{window_id}";
+const SEP: char = '\u{241F}';
+const PANE_FORMAT: &str = "#{session_id}\u{241F}#{session_name}\u{241F}#{session_attached}\u{241F}#{session_activity}\u{241F}#{window_id}\u{241F}#{window_index}\u{241F}#{window_name}\u{241F}#{window_active}\u{241F}#{pane_id}\u{241F}#{pane_active}\u{241F}#{pane_current_path}";
+const CURRENT_FORMAT: &str = "#{session_id}\u{241F}#{window_id}";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Fast tmux session/window picker")]
@@ -83,7 +85,6 @@ struct Entry {
     session_id: String,
     session_name: String,
     session_attached: bool,
-    session_windows: u32,
     session_activity: u64,
     window_id: String,
     window_index: String,
@@ -100,12 +101,23 @@ struct CurrentTarget {
     window_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SessionGroup {
+    id: String,
+    name: String,
+    attached: bool,
+    activity: u64,
+    /// Indices into `App::entries`, sorted by tmux window index ascending.
+    window_indices: Vec<usize>,
+}
+
 struct App {
     entries: Vec<Entry>,
-    selected: usize,
+    sessions: Vec<SessionGroup>,
+    selected_session: usize,
+    selected_window: usize,
     preview_lines: usize,
     inline_lines: usize,
-    all_windows: bool,
     refresh_seconds: u64,
     current: CurrentTarget,
     status: Option<String>,
@@ -114,13 +126,16 @@ struct App {
 impl App {
     fn load(options: Options) -> Result<Self> {
         let current = current_target();
-        let entries = load_entries(options.all_windows, options.preview_lines)?;
+        let entries = load_entries(true, options.preview_lines)?;
+        let sessions = group_sessions(&entries);
+        let (selected_session, selected_window) = initial_position(&sessions, &entries, &current);
         Ok(Self {
             entries,
-            selected: 0,
+            sessions,
+            selected_session,
+            selected_window,
             preview_lines: options.preview_lines,
             inline_lines: options.inline_lines,
-            all_windows: options.all_windows,
             refresh_seconds: options.refresh_seconds,
             current,
             status: None,
@@ -136,21 +151,35 @@ impl App {
     }
 
     fn refresh_with_status(&mut self, status: &str) {
-        let selected_pane = self.selected_entry().map(|entry| entry.pane_id.clone());
-        let selected_index = self.selected;
+        let prev_session_id = self
+            .sessions
+            .get(self.selected_session)
+            .map(|s| s.id.clone());
+        let prev_window_id = self.selected_entry().map(|e| e.window_id.clone());
 
-        match load_entries(self.all_windows, self.preview_lines) {
+        match load_entries(true, self.preview_lines) {
             Ok(entries) => {
+                let sessions = group_sessions(&entries);
                 self.entries = entries;
-                self.selected = selected_pane
-                    .and_then(|pane_id| {
-                        self.entries
-                            .iter()
-                            .position(|entry| entry.pane_id == pane_id)
+                self.sessions = sessions;
+                self.selected_session = prev_session_id
+                    .as_deref()
+                    .and_then(|id| self.sessions.iter().position(|s| s.id == id))
+                    .unwrap_or(0);
+                if self.selected_session >= self.sessions.len() {
+                    self.selected_session = self.sessions.len().saturating_sub(1);
+                }
+                self.selected_window = self
+                    .sessions
+                    .get(self.selected_session)
+                    .and_then(|s| {
+                        prev_window_id.as_deref().and_then(|wid| {
+                            s.window_indices
+                                .iter()
+                                .position(|&i| self.entries[i].window_id == wid)
+                        })
                     })
-                    .unwrap_or_else(|| {
-                        cmp::min(selected_index, self.entries.len().saturating_sub(1))
-                    });
+                    .unwrap_or(0);
                 self.current = current_target();
                 self.status = Some(status.to_string());
             }
@@ -160,34 +189,127 @@ impl App {
         }
     }
 
-    fn next(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        self.selected = cmp::min(self.selected + 1, self.entries.len() - 1);
+    fn current_session(&self) -> Option<&SessionGroup> {
+        self.sessions.get(self.selected_session)
     }
 
-    fn previous(&mut self) {
-        if self.entries.is_empty() {
+    fn next_window(&mut self) {
+        let Some(session) = self.current_session() else {
+            return;
+        };
+        if session.window_indices.is_empty() {
             return;
         }
-        self.selected = self.selected.saturating_sub(1);
+        self.selected_window = cmp::min(
+            self.selected_window + 1,
+            session.window_indices.len() - 1,
+        );
     }
 
-    fn page_down(&mut self) {
-        if self.entries.is_empty() {
+    fn previous_window(&mut self) {
+        if self.current_session().is_none() {
             return;
         }
-        self.selected = cmp::min(self.selected + 10, self.entries.len() - 1);
+        self.selected_window = self.selected_window.saturating_sub(1);
     }
 
-    fn page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(10);
+    fn next_session(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected_session = cmp::min(self.selected_session + 1, self.sessions.len() - 1);
+        self.selected_window = self.preferred_window_in_current_session();
+    }
+
+    fn previous_session(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected_session = self.selected_session.saturating_sub(1);
+        self.selected_window = self.preferred_window_in_current_session();
+    }
+
+    fn preferred_window_in_current_session(&self) -> usize {
+        self.current_session()
+            .and_then(|s| {
+                s.window_indices
+                    .iter()
+                    .position(|&i| self.entries[i].window_active)
+            })
+            .unwrap_or(0)
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
-        self.entries.get(self.selected)
+        let session = self.current_session()?;
+        let idx = *session.window_indices.get(self.selected_window)?;
+        self.entries.get(idx)
     }
+}
+
+fn group_sessions(entries: &[Entry]) -> Vec<SessionGroup> {
+    let mut map: HashMap<String, SessionGroup> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let group = map
+            .entry(entry.session_id.clone())
+            .or_insert_with(|| SessionGroup {
+                id: entry.session_id.clone(),
+                name: entry.session_name.clone(),
+                attached: entry.session_attached,
+                activity: entry.session_activity,
+                window_indices: Vec::new(),
+            });
+        group.window_indices.push(i);
+    }
+
+    let mut sessions: Vec<SessionGroup> = map.into_values().collect();
+    for session in &mut sessions {
+        session.window_indices.sort_by_key(|&i| {
+            entries[i]
+                .window_index
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+        });
+    }
+    sessions.sort_by(|a, b| {
+        b.attached
+            .cmp(&a.attached)
+            .then(b.activity.cmp(&a.activity))
+            .then(a.name.cmp(&b.name))
+    });
+    sessions
+}
+
+fn initial_position(
+    sessions: &[SessionGroup],
+    entries: &[Entry],
+    current: &CurrentTarget,
+) -> (usize, usize) {
+    let session_idx = current
+        .session_id
+        .as_deref()
+        .and_then(|id| sessions.iter().position(|s| s.id == id))
+        .unwrap_or(0);
+    let window_idx = sessions
+        .get(session_idx)
+        .and_then(|session| {
+            current
+                .window_id
+                .as_deref()
+                .and_then(|wid| {
+                    session
+                        .window_indices
+                        .iter()
+                        .position(|&i| entries[i].window_id == wid)
+                })
+                .or_else(|| {
+                    session
+                        .window_indices
+                        .iter()
+                        .position(|&i| entries[i].window_active)
+                })
+        })
+        .unwrap_or(0);
+    (session_idx, window_idx)
 }
 
 struct Tui {
@@ -288,36 +410,29 @@ fn run_picker(options: Options) -> Result<Option<Entry>> {
                 Event::Key(key) if should_quit(key) => return Ok(None),
                 Event::Key(key) if should_submit(key) => return Ok(app.selected_entry().cloned()),
                 Event::Key(KeyEvent {
-                    code: KeyCode::Char('j'),
+                    code: KeyCode::Char('j' | 'J') | KeyCode::Down,
                     ..
-                })
-                | Event::Key(KeyEvent {
-                    code: KeyCode::Char('J'),
-                    ..
-                })
-                | Event::Key(KeyEvent {
-                    code: KeyCode::Down,
-                    ..
-                }) => app.next(),
+                }) => app.next_window(),
                 Event::Key(KeyEvent {
-                    code: KeyCode::Char('k'),
+                    code: KeyCode::Char('k' | 'K') | KeyCode::Up,
                     ..
-                })
-                | Event::Key(KeyEvent {
-                    code: KeyCode::Char('K'),
-                    ..
-                })
-                | Event::Key(KeyEvent {
-                    code: KeyCode::Up, ..
-                }) => app.previous(),
+                }) => app.previous_window(),
                 Event::Key(KeyEvent {
-                    code: KeyCode::PageDown,
+                    code:
+                        KeyCode::Char('l' | 'L')
+                        | KeyCode::Right
+                        | KeyCode::Tab
+                        | KeyCode::PageDown,
                     ..
-                }) => app.page_down(),
+                }) => app.next_session(),
                 Event::Key(KeyEvent {
-                    code: KeyCode::PageUp,
+                    code:
+                        KeyCode::Char('h' | 'H')
+                        | KeyCode::Left
+                        | KeyCode::BackTab
+                        | KeyCode::PageUp,
                     ..
-                }) => app.page_up(),
+                }) => app.previous_session(),
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('r'),
                     ..
@@ -386,7 +501,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -403,42 +518,99 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mode = if app.all_windows {
-        "all windows"
-    } else {
-        "sessions"
-    };
+    let session_count = app.sessions.len();
+    let window_count: usize = app.sessions.iter().map(|s| s.window_indices.len()).sum();
+    let summary = Span::styled(
+        format!("{session_count} sessions · {window_count} windows"),
+        Style::default().fg(Color::Cyan),
+    );
+    let current_session = app
+        .current_session()
+        .map(|s| format!("  → {} ({})", s.name, s.window_indices.len()))
+        .unwrap_or_default();
+
     let title = Line::from(vec![
         Span::styled("tmux-jump", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(mode, Style::default().fg(Color::Cyan)),
-        Span::raw(format!("  {} entries", app.entries.len())),
+        summary,
+        Span::styled(current_session, Style::default().fg(Color::DarkGray)),
     ]);
+
+    let mut strip: Vec<Span> = vec![Span::styled(
+        "Sessions ",
+        Style::default().fg(Color::DarkGray),
+    )];
+    for (idx, session) in app.sessions.iter().enumerate() {
+        let is_selected = idx == app.selected_session;
+        let is_current = app.current.session_id.as_deref() == Some(session.id.as_str());
+
+        let mut style = Style::default();
+        if is_selected {
+            style = style
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD);
+        } else if is_current {
+            style = style
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+        } else if session.attached {
+            style = style.fg(Color::Green);
+        }
+
+        let marker = if is_current { "*" } else { "" };
+        strip.push(Span::styled(
+            format!(" {}{} ", session.name, marker),
+            style,
+        ));
+        strip.push(Span::raw(" "));
+    }
+    let sessions_line = Line::from(strip);
+
     let refresh = if app.refresh_seconds == 0 {
         "auto off".to_string()
     } else {
         format!("auto {}s", app.refresh_seconds)
     };
-    let help = Line::from(format!(
-        "j/k move  enter switch  r refresh  {refresh}  q/esc quit"
+    let help = Line::from(Span::styled(
+        format!(
+            "h/l session  j/k window  enter switch  r refresh  q/esc quit  ·  {refresh}"
+        ),
+        Style::default().fg(Color::DarkGray),
     ));
-    let paragraph = Paragraph::new(vec![title, help]).block(Block::default().borders(Borders::ALL));
+
+    let paragraph = Paragraph::new(vec![title, sessions_line, help])
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .entries
-        .iter()
-        .map(|entry| ListItem::new(list_item_lines(entry, app)))
-        .collect();
+    let title = match app.current_session() {
+        Some(session) => format!(
+            "{} · {} window{}{}",
+            session.name,
+            session.window_indices.len(),
+            if session.window_indices.len() == 1 { "" } else { "s" },
+            if session.attached { " · attached" } else { "" },
+        ),
+        None => "Windows".to_string(),
+    };
+
+    let items: Vec<ListItem> = match app.current_session() {
+        Some(session) => session
+            .window_indices
+            .iter()
+            .map(|&i| ListItem::new(window_item_lines(&app.entries[i], app)))
+            .collect(),
+        None => Vec::new(),
+    };
     let mut state = ListState::default();
     if !items.is_empty() {
-        state.select(Some(app.selected));
+        state.select(Some(app.selected_window));
     }
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Targets"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -449,41 +621,36 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn list_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
+fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     let mut flags = Vec::new();
     if is_current(entry, &app.current) {
         flags.push("current");
-    } else if entry.session_attached {
-        flags.push("attached");
     }
-    if app.all_windows && entry.window_active {
+    if entry.window_active {
         flags.push("active");
     }
     let flags = if flags.is_empty() {
         String::new()
     } else {
-        format!(" {}", flags.join(","))
+        format!("  {}", flags.join(","))
     };
 
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            entry.session_name.clone(),
+            format!("{:>3}: ", entry.window_index),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            entry.window_name.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "  {}:{}  {}  {}w  {}{}",
-            entry.window_index,
-            entry.window_name,
-            entry.pane_current_path,
-            entry.session_windows,
-            format_age(entry.session_activity),
-            flags
-        )),
+        Span::raw(format!("  {}", entry.pane_current_path)),
+        Span::styled(flags, Style::default().fg(Color::Yellow)),
     ])];
 
     for line in tail_non_empty(&entry.preview, app.inline_lines) {
         lines.push(Line::from(Span::styled(
-            format!("  {line}"),
+            format!("    {line}"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -557,7 +724,6 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
             session_id: row.session_id,
             session_name: row.session_name,
             session_attached: row.session_attached,
-            session_windows: row.session_windows,
             session_activity: row.session_activity,
             window_id: row.window_id,
             window_index: row.window_index,
@@ -581,7 +747,6 @@ struct PaneRow {
     session_id: String,
     session_name: String,
     session_attached: bool,
-    session_windows: u32,
     session_activity: u64,
     window_id: String,
     window_index: String,
@@ -595,22 +760,21 @@ struct PaneRow {
 impl PaneRow {
     fn parse(line: &str) -> Option<Self> {
         let fields: Vec<&str> = line.split(SEP).collect();
-        if fields.len() != 12 {
+        if fields.len() != 11 {
             return None;
         }
         Some(Self {
             session_id: fields[0].to_string(),
             session_name: fields[1].to_string(),
             session_attached: fields[2] != "0",
-            session_windows: fields[3].parse().unwrap_or(0),
-            session_activity: fields[4].parse().unwrap_or(0),
-            window_id: fields[5].to_string(),
-            window_index: fields[6].to_string(),
-            window_name: fields[7].to_string(),
-            window_active: fields[8] != "0",
-            pane_id: fields[9].to_string(),
-            pane_active: fields[10] != "0",
-            pane_current_path: fields[11].to_string(),
+            session_activity: fields[3].parse().unwrap_or(0),
+            window_id: fields[4].to_string(),
+            window_index: fields[5].to_string(),
+            window_name: fields[6].to_string(),
+            window_active: fields[7] != "0",
+            pane_id: fields[8].to_string(),
+            pane_active: fields[9] != "0",
+            pane_current_path: fields[10].to_string(),
         })
     }
 }
@@ -711,24 +875,6 @@ fn clean_line(line: &str) -> String {
         .collect()
 }
 
-fn format_age(unix_seconds: u64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(unix_seconds);
-    let seconds = now.saturating_sub(unix_seconds);
-
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 60 * 60 {
-        format!("{}m ago", seconds / 60)
-    } else if seconds < 60 * 60 * 24 {
-        format!("{}h ago", seconds / 60 / 60)
-    } else {
-        format!("{}d ago", seconds / 60 / 60 / 24)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,19 +939,10 @@ mod tests {
     fn window_lines_keeps_left_list_to_one_line_per_target() {
         let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "10"]).unwrap();
         let options = cli.options();
-        let app = App {
-            entries: vec![test_entry("0")],
-            selected: 0,
-            preview_lines: options.preview_lines,
-            inline_lines: options.inline_lines,
-            all_windows: options.all_windows,
-            refresh_seconds: options.refresh_seconds,
-            current: CurrentTarget::default(),
-            status: None,
-        };
+        let app = test_app_with_entries(&options, vec![test_entry("$0", "0", false)]);
         let entry = app.selected_entry().unwrap();
 
-        assert_eq!(list_item_lines(entry, &app).len(), 1);
+        assert_eq!(window_item_lines(entry, &app).len(), 1);
     }
 
     #[test]
@@ -825,38 +962,78 @@ mod tests {
     }
 
     #[test]
-    fn navigation_stops_at_first_and_last_entries() {
-        let mut app = App {
-            entries: vec![test_entry("0"), test_entry("1")],
-            selected: 0,
-            preview_lines: 5,
-            inline_lines: 5,
-            all_windows: true,
-            refresh_seconds: 5,
-            current: CurrentTarget::default(),
-            status: None,
-        };
+    fn window_navigation_stops_at_first_and_last_window() {
+        let options = default_options();
+        let mut app = test_app_with_entries(
+            &options,
+            vec![test_entry("$0", "0", true), test_entry("$0", "1", false)],
+        );
 
-        app.previous();
-        assert_eq!(app.selected, 0);
+        app.previous_window();
+        assert_eq!(app.selected_window, 0);
 
-        app.next();
-        app.next();
-        assert_eq!(app.selected, 1);
+        app.next_window();
+        app.next_window();
+        assert_eq!(app.selected_window, 1);
     }
 
-    fn test_entry(window_index: &str) -> Entry {
+    #[test]
+    fn session_navigation_jumps_to_active_window_of_target_session() {
+        let options = default_options();
+        let mut app = test_app_with_entries(
+            &options,
+            vec![
+                test_entry("$0", "0", false),
+                test_entry("$0", "1", false),
+                test_entry("$1", "0", false),
+                test_entry("$1", "1", true),
+            ],
+        );
+
+        assert_eq!(app.selected_session, 0);
+        assert_eq!(app.selected_window, 0);
+
+        app.next_session();
+        assert_eq!(app.selected_session, 1);
+        // session $1's active window is index 1
+        assert_eq!(app.selected_window, 1);
+
+        app.previous_session();
+        assert_eq!(app.selected_session, 0);
+    }
+
+    fn default_options() -> Options {
+        Cli::try_parse_from(["tmux-jump", "--window-lines", "10"])
+            .unwrap()
+            .options()
+    }
+
+    fn test_app_with_entries(options: &Options, entries: Vec<Entry>) -> App {
+        let sessions = group_sessions(&entries);
+        App {
+            entries,
+            sessions,
+            selected_session: 0,
+            selected_window: 0,
+            preview_lines: options.preview_lines,
+            inline_lines: options.inline_lines,
+            refresh_seconds: options.refresh_seconds,
+            current: CurrentTarget::default(),
+            status: None,
+        }
+    }
+
+    fn test_entry(session_id: &str, window_index: &str, window_active: bool) -> Entry {
         Entry {
-            session_id: "$0".to_string(),
-            session_name: "test".to_string(),
+            session_id: session_id.to_string(),
+            session_name: session_id.trim_start_matches('$').to_string(),
             session_attached: true,
-            session_windows: 2,
             session_activity: 0,
-            window_id: format!("@{window_index}"),
+            window_id: format!("@{}-{}", session_id.trim_start_matches('$'), window_index),
             window_index: window_index.to_string(),
             window_name: "window".to_string(),
-            window_active: false,
-            pane_id: "%0".to_string(),
+            window_active,
+            pane_id: format!("%{}-{}", session_id.trim_start_matches('$'), window_index),
             pane_current_path: "/tmp".to_string(),
             preview: Vec::new(),
         }

@@ -10,14 +10,18 @@ cargo run --release -- --all-windows
 
 Controls:
 
-- `j` / `k` or arrow keys: move
-- `Enter`: switch to the selected tmux target
+- `h` / `l` (or `←` / `→`, `Tab` / `Shift-Tab`): switch sessions across the top
+- `j` / `k` (or `↑` / `↓`): move through windows within the selected session
+- `Enter`: switch to the selected tmux window
 - `r`: refresh now
 - `q` / `Esc`: quit
 
-By default, `tmux-jump` shows one row per session and uses that session's active window.
-Use `--all-windows` when you want one row per tmux window. The picker refreshes
-preview output every 5 seconds while it is open.
+The picker groups every tmux window under its session. The header shows the
+session strip with a cursor; pressing `l` jumps to the next session's active
+window. The picker refreshes preview output every 5 seconds while it is open.
+`--all-windows` only affects the `--list` printout (it makes `--list` enumerate
+every window instead of just each session's active window); the interactive
+picker always shows the grouped view.
 
 Useful options:
 
