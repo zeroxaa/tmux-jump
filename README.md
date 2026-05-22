@@ -23,8 +23,12 @@ Useful options:
 ```sh
 tmux-jump --preview-lines 12
 tmux-jump --all-windows --inline-lines 3
+tmux-jump --window-lines 5
 tmux-jump --list --all-windows
 ```
+
+`--window-lines 5` is a shortcut for showing every tmux window with the last
+five non-empty pane output lines embedded directly in the target list.
 
 ## Install
 
@@ -45,11 +49,11 @@ bind-key J display-popup -E -w 90% -h 85% "tmux-jump"
 Prefix key window picker:
 
 ```tmux
-bind-key J display-popup -E -w 90% -h 85% "tmux-jump --all-windows"
+bind-key J display-popup -E -w 90% -h 85% "tmux-jump --window-lines 5"
 ```
 
 No-prefix window picker on `Alt-j`:
 
 ```tmux
-bind-key -n M-j display-popup -E -w 90% -h 85% "tmux-jump --all-windows"
+bind-key -n M-j display-popup -E -w 90% -h 85% "tmux-jump --window-lines 5"
 ```

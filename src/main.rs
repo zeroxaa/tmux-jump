@@ -30,6 +30,10 @@ struct Cli {
     #[arg(short = 'w', long)]
     all_windows: bool,
 
+    /// Shortcut preset: show all windows with the last N lines embedded per row.
+    #[arg(long, value_name = "LINES")]
+    window_lines: Option<usize>,
+
     /// Number of captured lines to show in the preview pane.
     #[arg(short = 'n', long, default_value_t = 10)]
     preview_lines: usize,
@@ -41,6 +45,30 @@ struct Cli {
     /// Print targets and exit without opening the picker.
     #[arg(long)]
     list: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Options {
+    all_windows: bool,
+    preview_lines: usize,
+    inline_lines: usize,
+}
+
+impl Cli {
+    fn options(&self) -> Options {
+        match self.window_lines {
+            Some(lines) => Options {
+                all_windows: true,
+                preview_lines: lines,
+                inline_lines: lines,
+            },
+            None => Options {
+                all_windows: self.all_windows,
+                preview_lines: self.preview_lines,
+                inline_lines: self.inline_lines,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,15 +104,15 @@ struct App {
 }
 
 impl App {
-    fn load(cli: &Cli) -> Result<Self> {
+    fn load(options: Options) -> Result<Self> {
         let current = current_target();
-        let entries = load_entries(cli.all_windows, cli.preview_lines)?;
+        let entries = load_entries(options.all_windows, options.preview_lines)?;
         Ok(Self {
             entries,
             selected: 0,
-            preview_lines: cli.preview_lines,
-            inline_lines: cli.inline_lines,
-            all_windows: cli.all_windows,
+            preview_lines: options.preview_lines,
+            inline_lines: options.inline_lines,
+            all_windows: options.all_windows,
             current,
             status: None,
         })
@@ -171,12 +199,13 @@ impl Drop for Tui {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let options = cli.options();
     if cli.list {
-        print_targets(&cli)?;
+        print_targets(options)?;
         return Ok(());
     }
 
-    let target = run_picker(&cli)?;
+    let target = run_picker(options)?;
 
     if let Some(entry) = target {
         switch_to(&entry)?;
@@ -185,26 +214,42 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_targets(cli: &Cli) -> Result<()> {
-    let entries = load_entries(cli.all_windows, cli.preview_lines)?;
+fn print_targets(options: Options) -> Result<()> {
+    let entries = load_entries(options.all_windows, options.preview_lines)?;
     for entry in entries {
-        let last_line = tail_non_empty(&entry.preview, 1)
-            .pop()
-            .unwrap_or_else(|| "<no output>".to_string());
-        println!(
-            "{}\t{}:{}\t{}\t{}",
-            entry.session_name,
-            entry.window_index,
-            entry.window_name,
-            entry.pane_current_path,
-            last_line
-        );
+        let lines = tail_non_empty(&entry.preview, cmp::max(options.inline_lines, 1));
+        if options.inline_lines <= 1 {
+            let last_line = lines
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<no output>".to_string());
+            println!(
+                "{}\t{}:{}\t{}\t{}",
+                entry.session_name,
+                entry.window_index,
+                entry.window_name,
+                entry.pane_current_path,
+                last_line
+            );
+        } else {
+            println!(
+                "{}\t{}:{}\t{}",
+                entry.session_name, entry.window_index, entry.window_name, entry.pane_current_path
+            );
+            if lines.is_empty() {
+                println!("  <no output>");
+            } else {
+                for line in lines {
+                    println!("  {line}");
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn run_picker(cli: &Cli) -> Result<Option<Entry>> {
-    let mut app = App::load(cli)?;
+fn run_picker(options: Options) -> Result<Option<Entry>> {
+    let mut app = App::load(options)?;
     let mut tui = Tui::new()?;
 
     loop {
@@ -617,5 +662,54 @@ fn format_age(unix_seconds: u64) -> String {
         format!("{}h ago", seconds / 60 / 60)
     } else {
         format!("{}d ago", seconds / 60 / 60 / 24)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_lines_enables_all_windows_and_sets_line_counts() {
+        let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "5"]).unwrap();
+        let options = cli.options();
+
+        assert!(options.all_windows);
+        assert_eq!(options.preview_lines, 5);
+        assert_eq!(options.inline_lines, 5);
+    }
+
+    #[test]
+    fn explicit_window_options_stay_independent_without_preset() {
+        let cli = Cli::try_parse_from([
+            "tmux-jump",
+            "--all-windows",
+            "--preview-lines",
+            "12",
+            "--inline-lines",
+            "3",
+        ])
+        .unwrap();
+        let options = cli.options();
+
+        assert!(options.all_windows);
+        assert_eq!(options.preview_lines, 12);
+        assert_eq!(options.inline_lines, 3);
+    }
+
+    #[test]
+    fn tail_non_empty_returns_last_non_empty_lines() {
+        let lines = vec![
+            "first".to_string(),
+            "".to_string(),
+            "second".to_string(),
+            "  ".to_string(),
+            "third".to_string(),
+        ];
+
+        assert_eq!(
+            tail_non_empty(&lines, 2),
+            vec!["second".to_string(), "third".to_string()]
+        );
     }
 }
