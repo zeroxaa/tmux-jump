@@ -23,14 +23,13 @@ Useful options:
 
 ```sh
 tmux-jump --preview-lines 12
-tmux-jump --all-windows --inline-lines 3
 tmux-jump --window-lines 10
 tmux-jump --refresh-seconds 0
 tmux-jump --list --all-windows
 ```
 
 `--window-lines 10` is a shortcut for showing every tmux window with the last
-ten non-empty pane output lines embedded directly in the target list.
+ten captured pane output lines in the right preview pane.
 Use `--refresh-seconds 0` to disable automatic refresh.
 
 ## Install

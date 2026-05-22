@@ -30,7 +30,7 @@ struct Cli {
     #[arg(short = 'w', long)]
     all_windows: bool,
 
-    /// Shortcut preset: show all windows with the last N lines embedded per row.
+    /// Shortcut preset: show all windows with the last N lines in the preview pane.
     #[arg(long, value_name = "LINES")]
     window_lines: Option<usize>,
 
@@ -39,7 +39,7 @@ struct Cli {
     preview_lines: usize,
 
     /// Number of preview lines embedded into each row in the left list.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 0)]
     inline_lines: usize,
 
     /// Seconds between automatic refreshes while the picker is open. Use 0 to disable.
@@ -65,7 +65,7 @@ impl Cli {
             Some(lines) => Options {
                 all_windows: true,
                 preview_lines: lines,
-                inline_lines: lines,
+                inline_lines: 0,
                 refresh_seconds: self.refresh_seconds,
             },
             None => Options {
@@ -393,7 +393,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(vertical[1]);
 
     render_header(frame, vertical[0], app);
@@ -430,7 +430,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .entries
         .iter()
-        .map(|entry| list_item(entry, app))
+        .map(|entry| ListItem::new(list_item_lines(entry, app)))
         .collect();
     let mut state = ListState::default();
     if !items.is_empty() {
@@ -449,7 +449,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn list_item<'a>(entry: &'a Entry, app: &App) -> ListItem<'a> {
+fn list_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     let mut flags = Vec::new();
     if is_current(entry, &app.current) {
         flags.push("current");
@@ -488,7 +488,7 @@ fn list_item<'a>(entry: &'a Entry, app: &App) -> ListItem<'a> {
         )));
     }
 
-    ListItem::new(lines)
+    lines
 }
 
 fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -740,7 +740,7 @@ mod tests {
 
         assert!(options.all_windows);
         assert_eq!(options.preview_lines, 10);
-        assert_eq!(options.inline_lines, 10);
+        assert_eq!(options.inline_lines, 0);
         assert_eq!(options.refresh_seconds, 5);
     }
 
@@ -787,6 +787,25 @@ mod tests {
         ));
         assert!(!refresh_due(Some(Duration::from_secs(5)), Instant::now()));
         assert!(!refresh_due(None, Instant::now() - Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn window_lines_keeps_left_list_to_one_line_per_target() {
+        let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "10"]).unwrap();
+        let options = cli.options();
+        let app = App {
+            entries: vec![test_entry("0")],
+            selected: 0,
+            preview_lines: options.preview_lines,
+            inline_lines: options.inline_lines,
+            all_windows: options.all_windows,
+            refresh_seconds: options.refresh_seconds,
+            current: CurrentTarget::default(),
+            status: None,
+        };
+        let entry = app.selected_entry().unwrap();
+
+        assert_eq!(list_item_lines(entry, &app).len(), 1);
     }
 
     #[test]
