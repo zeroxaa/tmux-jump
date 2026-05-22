@@ -42,6 +42,11 @@ cargo install --path .
 
 Put one of these in `~/.tmux.conf`.
 
+Recommended shortcut:
+
+- `prefix + j` opens the all-window picker.
+- With tmux's default prefix, press `Control-B`, then `j`.
+
 Prefix key session picker:
 
 ```tmux
