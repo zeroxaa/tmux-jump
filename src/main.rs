@@ -4,6 +4,7 @@ use std::{
     env,
     io::{self, Stdout},
     process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
@@ -152,18 +153,14 @@ struct App {
     refresh_seconds: u64,
     current: CurrentTarget,
     status: Option<String>,
+    probe: Option<Receiver<ActivityProbeResult>>,
 }
 
 impl App {
     fn load(options: Options) -> Result<Self> {
         let current = current_target();
-        let mut entries = load_entries(true, options.preview_lines)?;
-        probe_initial_activity(
-            &mut entries,
-            options.preview_lines,
-            options.activity_samples,
-            options.activity_interval,
-        );
+        let entries = load_entries(true, options.preview_lines)?;
+        let probe = spawn_activity_probe(&entries, &options);
         let sessions = group_sessions(&entries);
         let (selected_session, selected_window) = initial_position(&sessions, &entries, &current);
         Ok(Self {
@@ -176,7 +173,36 @@ impl App {
             refresh_seconds: options.refresh_seconds,
             current,
             status: None,
+            probe,
         })
+    }
+
+    /// Drain any completed background activity probe and merge its result
+    /// into our entries. Called on every loop iteration; cheap when the
+    /// probe is still running or already drained.
+    fn poll_probe(&mut self) -> bool {
+        let Some(rx) = &self.probe else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                for entry in &mut self.entries {
+                    if let Some(activity) = result.activity.get(&entry.pane_id) {
+                        entry.activity = *activity;
+                    }
+                    if let Some(fp) = result.fingerprints.get(&entry.pane_id) {
+                        entry.activity_fingerprint = fp.clone();
+                    }
+                }
+                self.probe = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.probe = None;
+                false
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -188,6 +214,9 @@ impl App {
     }
 
     fn refresh_with_status(&mut self, status: &str) {
+        // Discard any in-flight startup probe — refresh data is fresher and the
+        // probe's fingerprints would clobber the post-refresh state.
+        self.probe = None;
         let prev_session_id = self
             .sessions
             .get(self.selected_session)
@@ -444,6 +473,7 @@ fn run_picker(options: Options) -> Result<Option<Entry>> {
     let mut last_refresh = Instant::now();
 
     loop {
+        app.poll_probe();
         tui.draw(&app)?;
 
         if event::poll(poll_timeout(refresh_interval, last_refresh))
@@ -920,56 +950,73 @@ fn apply_activity(entries: &mut [Entry], baseline: &HashMap<String, String>) {
     }
 }
 
-/// Probe each pane multiple times at startup, `interval` apart. A pane is
-/// marked `Active` if any consecutive pair of samples differs — catches
-/// bursty output that a single short window might miss.
-fn probe_initial_activity(
-    entries: &mut [Entry],
-    preview_lines: usize,
-    samples: usize,
-    interval: Duration,
-) {
-    if entries.is_empty() || samples < 2 {
-        // Single-sample case: leave activity as `Unknown` so the first
-        // auto-refresh establishes a baseline against the second sample.
-        return;
+/// Result of a background activity probe — per-pane Active/Idle verdict plus
+/// the latest fingerprint, both keyed by `pane_id`.
+struct ActivityProbeResult {
+    activity: HashMap<String, Activity>,
+    fingerprints: HashMap<String, String>,
+}
+
+/// Spawn a background thread that re-samples each pane `activity_samples - 1`
+/// more times, `activity_interval` apart, and sends the verdict over a channel.
+/// Returns `None` if probing is disabled or there are no entries to probe.
+///
+/// Running off-thread is important: probing for 23 panes × 3 extra samples ×
+/// 300ms interval takes ~1s, which used to block the picker from drawing.
+fn spawn_activity_probe(
+    entries: &[Entry],
+    options: &Options,
+) -> Option<Receiver<ActivityProbeResult>> {
+    if entries.is_empty() || options.activity_samples < 2 {
+        return None;
     }
 
-    // Track whether any consecutive pair of samples differed per pane.
-    let mut any_change: HashMap<String, bool> = entries
-        .iter()
-        .map(|e| (e.pane_id.clone(), false))
-        .collect();
-    // Initial fingerprints are already in `entries` from load_entries.
-    let mut prev: HashMap<String, String> = entries
+    let pane_ids: Vec<String> = entries.iter().map(|e| e.pane_id.clone()).collect();
+    let initial_fingerprints: HashMap<String, String> = entries
         .iter()
         .map(|e| (e.pane_id.clone(), e.activity_fingerprint.clone()))
         .collect();
+    let preview_lines = options.preview_lines;
+    let samples = options.activity_samples;
+    let interval = options.activity_interval;
 
-    for _ in 1..samples {
-        thread::sleep(interval);
-        for entry in entries.iter_mut() {
-            entry.preview = capture_preview(&entry.pane_id, preview_lines);
-            entry.activity_fingerprint = activity_fingerprint_of(&entry.preview);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut any_change: HashMap<String, bool> =
+            pane_ids.iter().map(|id| (id.clone(), false)).collect();
+        let mut latest = initial_fingerprints.clone();
 
-            if let Some(prev_fp) = prev.get(&entry.pane_id) {
-                if *prev_fp != entry.activity_fingerprint {
-                    if let Some(flag) = any_change.get_mut(&entry.pane_id) {
-                        *flag = true;
+        for _ in 1..samples {
+            thread::sleep(interval);
+            for pane_id in &pane_ids {
+                let preview = capture_preview(pane_id, preview_lines);
+                let fp = activity_fingerprint_of(&preview);
+                if let Some(prev_fp) = latest.get(pane_id) {
+                    if *prev_fp != fp {
+                        if let Some(flag) = any_change.get_mut(pane_id) {
+                            *flag = true;
+                        }
                     }
                 }
+                latest.insert(pane_id.clone(), fp);
             }
-            prev.insert(entry.pane_id.clone(), entry.activity_fingerprint.clone());
         }
-    }
 
-    for entry in entries.iter_mut() {
-        entry.activity = if *any_change.get(&entry.pane_id).unwrap_or(&false) {
-            Activity::Active
-        } else {
-            Activity::Idle
-        };
-    }
+        let activity = any_change
+            .into_iter()
+            .map(|(id, changed)| {
+                (id, if changed { Activity::Active } else { Activity::Idle })
+            })
+            .collect();
+
+        // Receiver may already be dropped if the picker was closed early.
+        let _ = tx.send(ActivityProbeResult {
+            activity,
+            fingerprints: latest,
+        });
+    });
+
+    Some(rx)
 }
 
 fn switch_to(entry: &Entry) -> Result<()> {
@@ -1227,6 +1274,7 @@ mod tests {
             refresh_seconds: options.refresh_seconds,
             current: CurrentTarget::default(),
             status: None,
+            probe: None,
         }
     }
 
