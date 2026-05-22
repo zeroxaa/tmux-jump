@@ -136,18 +136,14 @@ impl App {
         if self.entries.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1) % self.entries.len();
+        self.selected = cmp::min(self.selected + 1, self.entries.len() - 1);
     }
 
     fn previous(&mut self) {
         if self.entries.is_empty() {
             return;
         }
-        self.selected = if self.selected == 0 {
-            self.entries.len() - 1
-        } else {
-            self.selected - 1
-        };
+        self.selected = self.selected.saturating_sub(1);
     }
 
     fn page_down(&mut self) {
@@ -711,5 +707,42 @@ mod tests {
             tail_non_empty(&lines, 2),
             vec!["second".to_string(), "third".to_string()]
         );
+    }
+
+    #[test]
+    fn navigation_stops_at_first_and_last_entries() {
+        let mut app = App {
+            entries: vec![test_entry("0"), test_entry("1")],
+            selected: 0,
+            preview_lines: 5,
+            inline_lines: 5,
+            all_windows: true,
+            current: CurrentTarget::default(),
+            status: None,
+        };
+
+        app.previous();
+        assert_eq!(app.selected, 0);
+
+        app.next();
+        app.next();
+        assert_eq!(app.selected, 1);
+    }
+
+    fn test_entry(window_index: &str) -> Entry {
+        Entry {
+            session_id: "$0".to_string(),
+            session_name: "test".to_string(),
+            session_attached: true,
+            session_windows: 2,
+            session_activity: 0,
+            window_id: format!("@{window_index}"),
+            window_index: window_index.to_string(),
+            window_name: "window".to_string(),
+            window_active: false,
+            pane_id: "%0".to_string(),
+            pane_current_path: "/tmp".to_string(),
+            preview: Vec::new(),
+        }
     }
 }

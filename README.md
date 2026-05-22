@@ -43,13 +43,13 @@ Put one of these in `~/.tmux.conf`.
 Prefix key session picker:
 
 ```tmux
-bind-key J display-popup -E -w 90% -h 85% "tmux-jump"
+bind-key j display-popup -E -w 90% -h 85% "tmux-jump"
 ```
 
 Prefix key window picker:
 
 ```tmux
-bind-key J display-popup -E -w 90% -h 85% "tmux-jump --window-lines 5"
+bind-key j display-popup -E -w 90% -h 85% "tmux-jump --window-lines 5"
 ```
 
 No-prefix window picker on `Alt-j`:
