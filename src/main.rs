@@ -622,9 +622,10 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
+    let current = is_current(entry, &app.current);
     let mut flags = Vec::new();
-    if is_current(entry, &app.current) {
-        flags.push("current");
+    if current {
+        flags.push("here");
     }
     if entry.window_active {
         flags.push("active");
@@ -635,15 +636,30 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         format!("  {}", flags.join(","))
     };
 
+    let marker = if current { "● " } else { "  " };
+    let marker_style = if current {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let name_style = if current {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+
     let mut lines = vec![Line::from(vec![
+        Span::styled(marker, marker_style),
         Span::styled(
             format!("{:>3}: ", entry.window_index),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(
-            entry.window_name.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(entry.window_name.clone(), name_style),
         Span::raw(format!("  {}", entry.pane_current_path)),
         Span::styled(flags, Style::default().fg(Color::Yellow)),
     ])];
@@ -975,6 +991,43 @@ mod tests {
         app.next_window();
         app.next_window();
         assert_eq!(app.selected_window, 1);
+    }
+
+    #[test]
+    fn initial_position_lands_on_current_session_and_window() {
+        let entries = vec![
+            test_entry("$0", "0", false),
+            test_entry("$0", "1", true),
+            test_entry("$1", "0", false),
+            test_entry("$1", "1", true),
+        ];
+        let sessions = group_sessions(&entries);
+
+        // Pretend the user opened the picker from session $1, window with id of entry[2].
+        let current = CurrentTarget {
+            session_id: Some("$1".to_string()),
+            window_id: Some(entries[2].window_id.clone()),
+        };
+        let (s, w) = initial_position(&sessions, &entries, &current);
+        let landed = &entries[sessions[s].window_indices[w]];
+        assert_eq!(landed.session_id, "$1");
+        assert_eq!(landed.window_id, entries[2].window_id);
+    }
+
+    #[test]
+    fn initial_position_falls_back_to_active_window_when_id_missing() {
+        let entries = vec![
+            test_entry("$0", "0", false),
+            test_entry("$0", "1", true),
+        ];
+        let sessions = group_sessions(&entries);
+        let current = CurrentTarget {
+            session_id: Some("$0".to_string()),
+            window_id: Some("@does-not-exist".to_string()),
+        };
+        let (s, w) = initial_position(&sessions, &entries, &current);
+        let landed = &entries[sessions[s].window_indices[w]];
+        assert!(landed.window_active);
     }
 
     #[test]
