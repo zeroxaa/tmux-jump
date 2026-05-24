@@ -11,8 +11,12 @@ cargo run --release -- --all-windows
 Controls:
 
 - `h` / `l` (or `←` / `→`, `Tab` / `Shift-Tab`): switch sessions across the top
-- `j` / `k` (or `↑` / `↓`): move through windows within the selected session
+- `j` / `k` (or `↑` / `↓`): move through windows within the selected session (wraps around)
 - `Enter`: switch to the selected tmux window
+- `$`: rename the selected session (Enter saves, Esc cancels)
+- `,`: rename the selected window (Enter saves, Esc cancels)
+- `x`: kill the selected window (`y` confirms, `n` / `Esc` cancels)
+- `X`: kill the selected session (`y` confirms, `n` / `Esc` cancels)
 - `r`: refresh now
 - `q` / `Esc`: quit
 

@@ -143,6 +143,37 @@ struct SessionGroup {
     window_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameKind {
+    Session,
+    Window,
+}
+
+/// In-progress inline rename of the selected session or window.
+#[derive(Debug, Clone)]
+struct RenameState {
+    kind: RenameKind,
+    /// session id (for Session) or window id (for Window).
+    target_id: String,
+    original: String,
+    buffer: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillKind {
+    Session,
+    Window,
+}
+
+/// A pending, not-yet-confirmed kill of the selected session or window.
+#[derive(Debug, Clone)]
+struct KillState {
+    kind: KillKind,
+    /// session id (for Session) or window id (for Window).
+    target_id: String,
+    label: String,
+}
+
 struct App {
     entries: Vec<Entry>,
     sessions: Vec<SessionGroup>,
@@ -154,6 +185,8 @@ struct App {
     current: CurrentTarget,
     status: Option<String>,
     probe: Option<Receiver<ActivityProbeResult>>,
+    rename: Option<RenameState>,
+    confirm_kill: Option<KillState>,
 }
 
 impl App {
@@ -174,6 +207,8 @@ impl App {
             current,
             status: None,
             probe,
+            rename: None,
+            confirm_kill: None,
         })
     }
 
@@ -269,20 +304,22 @@ impl App {
         let Some(session) = self.current_session() else {
             return;
         };
-        if session.window_indices.is_empty() {
+        let len = session.window_indices.len();
+        if len == 0 {
             return;
         }
-        self.selected_window = cmp::min(
-            self.selected_window + 1,
-            session.window_indices.len() - 1,
-        );
+        self.selected_window = (self.selected_window + 1) % len;
     }
 
     fn previous_window(&mut self) {
-        if self.current_session().is_none() {
+        let Some(session) = self.current_session() else {
+            return;
+        };
+        let len = session.window_indices.len();
+        if len == 0 {
             return;
         }
-        self.selected_window = self.selected_window.saturating_sub(1);
+        self.selected_window = (self.selected_window + len - 1) % len;
     }
 
     fn next_session(&mut self) {
@@ -315,6 +352,125 @@ impl App {
         let session = self.current_session()?;
         let idx = *session.window_indices.get(self.selected_window)?;
         self.entries.get(idx)
+    }
+
+    fn begin_rename_session(&mut self) {
+        if let Some(session) = self.current_session() {
+            self.rename = Some(RenameState {
+                kind: RenameKind::Session,
+                target_id: session.id.clone(),
+                original: session.name.clone(),
+                buffer: session.name.clone(),
+            });
+        }
+    }
+
+    fn begin_rename_window(&mut self) {
+        if let Some(entry) = self.selected_entry() {
+            self.rename = Some(RenameState {
+                kind: RenameKind::Window,
+                target_id: entry.window_id.clone(),
+                original: entry.window_name.clone(),
+                buffer: entry.window_name.clone(),
+            });
+        }
+    }
+
+    fn rename_input(&mut self, c: char) {
+        if let Some(rename) = &mut self.rename {
+            rename.buffer.push(c);
+        }
+    }
+
+    fn rename_backspace(&mut self) {
+        if let Some(rename) = &mut self.rename {
+            rename.buffer.pop();
+        }
+    }
+
+    fn cancel_rename(&mut self) {
+        if self.rename.take().is_some() {
+            self.status = Some("rename cancelled".to_string());
+        }
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(rename) = self.rename.take() else {
+            return;
+        };
+        let new_name = rename.buffer.trim();
+        if new_name.is_empty() || new_name == rename.original {
+            self.status = Some("rename cancelled".to_string());
+            return;
+        }
+        let result = match rename.kind {
+            RenameKind::Session => {
+                tmux_status(["rename-session", "-t", rename.target_id.as_str(), new_name])
+            }
+            RenameKind::Window => {
+                tmux_status(["rename-window", "-t", rename.target_id.as_str(), new_name])
+            }
+        };
+        match result {
+            Ok(()) => {
+                let what = match rename.kind {
+                    RenameKind::Session => "session",
+                    RenameKind::Window => "window",
+                };
+                self.refresh_with_status(&format!("renamed {what} to {new_name}"));
+            }
+            Err(err) => {
+                self.status = Some(format!("rename failed: {err:#}"));
+            }
+        }
+    }
+
+    fn begin_kill_window(&mut self) {
+        if let Some(entry) = self.selected_entry() {
+            self.confirm_kill = Some(KillState {
+                kind: KillKind::Window,
+                target_id: entry.window_id.clone(),
+                label: format!("{}: {}", entry.window_index, entry.window_name),
+            });
+        }
+    }
+
+    fn begin_kill_session(&mut self) {
+        if let Some(session) = self.current_session() {
+            self.confirm_kill = Some(KillState {
+                kind: KillKind::Session,
+                target_id: session.id.clone(),
+                label: session.name.clone(),
+            });
+        }
+    }
+
+    fn cancel_kill(&mut self) {
+        if self.confirm_kill.take().is_some() {
+            self.status = Some("kill cancelled".to_string());
+        }
+    }
+
+    fn commit_kill(&mut self) {
+        let Some(kill) = self.confirm_kill.take() else {
+            return;
+        };
+        let result = match kill.kind {
+            KillKind::Session => tmux_status(["kill-session", "-t", kill.target_id.as_str()]),
+            KillKind::Window => tmux_status(["kill-window", "-t", kill.target_id.as_str()]),
+        };
+        match result {
+            Ok(()) => {
+                let what = match kill.kind {
+                    KillKind::Session => "session",
+                    KillKind::Window => "window",
+                };
+                self.refresh_with_status(&format!("killed {what} {}", kill.label));
+            }
+            Err(err) => {
+                self.status = Some(format!("kill failed: {err:#}"));
+            }
+        }
     }
 }
 
@@ -478,46 +634,39 @@ fn run_picker(options: Options) -> Result<Option<Entry>> {
 
         if event::poll(poll_timeout(refresh_interval, last_refresh))
             .context("poll terminal event")?
+            && let Event::Key(key) = event::read().context("read terminal event")?
         {
-            match event::read().context("read terminal event")? {
-                Event::Key(key) if should_quit(key) => return Ok(None),
-                Event::Key(key) if should_submit(key) => return Ok(app.selected_entry().cloned()),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('j' | 'J') | KeyCode::Down,
-                    ..
-                }) => app.next_window(),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('k' | 'K') | KeyCode::Up,
-                    ..
-                }) => app.previous_window(),
-                Event::Key(KeyEvent {
-                    code:
-                        KeyCode::Char('l' | 'L')
-                        | KeyCode::Right
-                        | KeyCode::Tab
-                        | KeyCode::PageDown,
-                    ..
-                }) => app.next_session(),
-                Event::Key(KeyEvent {
-                    code:
-                        KeyCode::Char('h' | 'H')
-                        | KeyCode::Left
-                        | KeyCode::BackTab
-                        | KeyCode::PageUp,
-                    ..
-                }) => app.previous_session(),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('r'),
-                    ..
-                })
-                | Event::Key(KeyEvent {
-                    code: KeyCode::Char('R'),
-                    ..
-                }) => {
-                    app.refresh();
-                    last_refresh = Instant::now();
+            // While renaming, all printable keys edit the name buffer.
+            if app.rename.is_some() {
+                handle_rename_key(&mut app, key);
+            } else if app.confirm_kill.is_some() {
+                handle_kill_key(&mut app, key);
+            } else if should_quit(key) {
+                return Ok(None);
+            } else if should_submit(key) {
+                return Ok(app.selected_entry().cloned());
+            } else {
+                match key.code {
+                    KeyCode::Char('j' | 'J') | KeyCode::Down => app.next_window(),
+                    KeyCode::Char('k' | 'K') | KeyCode::Up => app.previous_window(),
+                    KeyCode::Char('l' | 'L')
+                    | KeyCode::Right
+                    | KeyCode::Tab
+                    | KeyCode::PageDown => app.next_session(),
+                    KeyCode::Char('h' | 'H')
+                    | KeyCode::Left
+                    | KeyCode::BackTab
+                    | KeyCode::PageUp => app.previous_session(),
+                    KeyCode::Char('r' | 'R') => {
+                        app.refresh();
+                        last_refresh = Instant::now();
+                    }
+                    KeyCode::Char('$') => app.begin_rename_session(),
+                    KeyCode::Char(',') => app.begin_rename_window(),
+                    KeyCode::Char('x') => app.begin_kill_window(),
+                    KeyCode::Char('X') => app.begin_kill_session(),
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -525,6 +674,33 @@ fn run_picker(options: Options) -> Result<Option<Entry>> {
             app.auto_refresh();
             last_refresh = Instant::now();
         }
+    }
+}
+
+/// Handle a key while an inline rename is in progress: Enter commits, Esc (or
+/// Ctrl-C) cancels, Backspace deletes, and printable characters extend the name.
+fn handle_rename_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => app.commit_rename(),
+        KeyCode::Esc => app.cancel_rename(),
+        KeyCode::Backspace => app.rename_backspace(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_rename(),
+        KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.rename_input(c);
+        }
+        _ => {}
+    }
+}
+
+/// Handle a key while a kill is awaiting confirmation: only `y` goes through;
+/// `n`, `q`, `Esc`, or Ctrl-C back out. Anything else is ignored so a stray
+/// keystroke can't destroy a window or session.
+fn handle_kill_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y' | 'Y') => app.commit_kill(),
+        KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => app.cancel_kill(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_kill(),
+        _ => {}
     }
 }
 
@@ -652,7 +828,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let help = Line::from(Span::styled(
         format!(
-            "h/l session  j/k window  enter switch  r refresh  q/esc quit  ·  {refresh}"
+            "h/l session  j/k window  enter switch  $/, rename ses/win  X/x kill ses/win  r refresh  q/esc quit  ·  {refresh}"
         ),
         Style::default().fg(Color::DarkGray),
     ));
@@ -811,6 +987,57 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(kill) = &app.confirm_kill {
+        let what = match kill.kind {
+            KillKind::Session => "session",
+            KillKind::Window => "window",
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("kill {what} "),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("\"{}\"?", kill.label),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   y confirm · n cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    if let Some(rename) = &app.rename {
+        let what = match rename.kind {
+            RenameKind::Session => "session",
+            RenameKind::Window => "window",
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("rename {what} "),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("\"{}\" → ", rename.original),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                rename.buffer.clone(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▏", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "   enter save · esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let text = app
         .status
         .as_deref()
@@ -1179,19 +1406,21 @@ mod tests {
     }
 
     #[test]
-    fn window_navigation_stops_at_first_and_last_window() {
+    fn window_navigation_wraps_at_first_and_last_window() {
         let options = default_options();
         let mut app = test_app_with_entries(
             &options,
             vec![test_entry("$0", "0", true), test_entry("$0", "1", false)],
         );
 
-        app.previous_window();
+        // Starting at the first window, `k` wraps to the last.
         assert_eq!(app.selected_window, 0);
-
-        app.next_window();
-        app.next_window();
+        app.previous_window();
         assert_eq!(app.selected_window, 1);
+
+        // From the last window, `j` wraps back to the first.
+        app.next_window();
+        assert_eq!(app.selected_window, 0);
     }
 
     #[test]
@@ -1256,6 +1485,84 @@ mod tests {
         assert_eq!(app.selected_session, 0);
     }
 
+    #[test]
+    fn rename_session_starts_from_current_name_and_edits_buffer() {
+        let options = default_options();
+        let mut app = test_app_with_entries(
+            &options,
+            vec![test_entry("$0", "0", true), test_entry("$0", "1", false)],
+        );
+
+        app.begin_rename_session();
+        let rename = app.rename.as_ref().expect("rename started");
+        assert_eq!(rename.kind, RenameKind::Session);
+        assert_eq!(rename.target_id, "$0");
+        // session name for "$0" is "0", so buffer seeds with the current name.
+        assert_eq!(rename.buffer, "0");
+
+        app.rename_input('x');
+        app.rename_input('y');
+        assert_eq!(app.rename.as_ref().unwrap().buffer, "0xy");
+
+        app.rename_backspace();
+        assert_eq!(app.rename.as_ref().unwrap().buffer, "0x");
+
+        app.cancel_rename();
+        assert!(app.rename.is_none());
+    }
+
+    #[test]
+    fn rename_window_targets_selected_window_id() {
+        let options = default_options();
+        let mut app = test_app_with_entries(
+            &options,
+            vec![test_entry("$0", "0", true), test_entry("$0", "1", false)],
+        );
+        app.selected_window = 1;
+
+        app.begin_rename_window();
+        let rename = app.rename.as_ref().expect("rename started");
+        assert_eq!(rename.kind, RenameKind::Window);
+        // window_id for ("$0","1") is "@0-1"; original name is "window".
+        assert_eq!(rename.target_id, "@0-1");
+        assert_eq!(rename.buffer, "window");
+    }
+
+    #[test]
+    fn kill_window_targets_selected_window_and_cancels() {
+        let options = default_options();
+        let mut app = test_app_with_entries(
+            &options,
+            vec![test_entry("$0", "0", true), test_entry("$0", "1", false)],
+        );
+        app.selected_window = 1;
+
+        app.begin_kill_window();
+        let kill = app.confirm_kill.as_ref().expect("kill pending");
+        assert_eq!(kill.kind, KillKind::Window);
+        assert_eq!(kill.target_id, "@0-1");
+        assert_eq!(kill.label, "1: window");
+
+        app.cancel_kill();
+        assert!(app.confirm_kill.is_none());
+    }
+
+    #[test]
+    fn kill_session_targets_current_session() {
+        let options = default_options();
+        let mut app = test_app_with_entries(
+            &options,
+            vec![test_entry("$0", "0", true), test_entry("$1", "0", false)],
+        );
+        app.selected_session = 1;
+
+        app.begin_kill_session();
+        let kill = app.confirm_kill.as_ref().expect("kill pending");
+        assert_eq!(kill.kind, KillKind::Session);
+        assert_eq!(kill.target_id, "$1");
+        assert_eq!(kill.label, "1");
+    }
+
     fn default_options() -> Options {
         Cli::try_parse_from(["tmux-jump", "--window-lines", "10"])
             .unwrap()
@@ -1275,6 +1582,8 @@ mod tests {
             current: CurrentTarget::default(),
             status: None,
             probe: None,
+            rename: None,
+            confirm_kill: None,
         }
     }
 
