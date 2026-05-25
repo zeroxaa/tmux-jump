@@ -300,26 +300,49 @@ impl App {
         self.sessions.get(self.selected_session)
     }
 
+    /// Advance to the next window in the flat list, flowing into the next
+    /// session at a session boundary and wrapping around at the very end.
     fn next_window(&mut self) {
         let Some(session) = self.current_session() else {
             return;
         };
-        let len = session.window_indices.len();
-        if len == 0 {
+        if self.selected_window + 1 < session.window_indices.len() {
+            self.selected_window += 1;
             return;
         }
-        self.selected_window = (self.selected_window + 1) % len;
+        let n = self.sessions.len();
+        let mut si = self.selected_session;
+        for _ in 0..n {
+            si = (si + 1) % n;
+            if !self.sessions[si].window_indices.is_empty() {
+                self.selected_session = si;
+                self.selected_window = 0;
+                return;
+            }
+        }
     }
 
+    /// Step to the previous window in the flat list, flowing into the previous
+    /// session's last window at a boundary and wrapping around at the top.
     fn previous_window(&mut self) {
-        let Some(session) = self.current_session() else {
-            return;
-        };
-        let len = session.window_indices.len();
-        if len == 0 {
+        if self.current_session().is_none() {
             return;
         }
-        self.selected_window = (self.selected_window + len - 1) % len;
+        if self.selected_window > 0 {
+            self.selected_window -= 1;
+            return;
+        }
+        let n = self.sessions.len();
+        let mut si = self.selected_session;
+        for _ in 0..n {
+            si = (si + n - 1) % n;
+            let len = self.sessions[si].window_indices.len();
+            if len > 0 {
+                self.selected_session = si;
+                self.selected_window = len - 1;
+                return;
+            }
+        }
     }
 
     fn next_session(&mut self) {
@@ -750,7 +773,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(4),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -790,37 +813,6 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(current_session, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let mut strip: Vec<Span> = vec![Span::styled(
-        "Sessions ",
-        Style::default().fg(Color::DarkGray),
-    )];
-    for (idx, session) in app.sessions.iter().enumerate() {
-        let is_selected = idx == app.selected_session;
-        let is_current = app.current.session_id.as_deref() == Some(session.id.as_str());
-
-        let mut style = Style::default();
-        if is_selected {
-            style = style
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD);
-        } else if is_current {
-            style = style
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD);
-        } else if session.attached {
-            style = style.fg(Color::Green);
-        }
-
-        let marker = if is_current { "*" } else { "" };
-        strip.push(Span::styled(
-            format!(" {}{} ", session.name, marker),
-            style,
-        ));
-        strip.push(Span::raw(" "));
-    }
-    let sessions_line = Line::from(strip);
-
     let refresh = if app.refresh_seconds == 0 {
         "auto off".to_string()
     } else {
@@ -828,39 +820,43 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let help = Line::from(Span::styled(
         format!(
-            "h/l session  j/k window  enter switch  $/, rename ses/win  X/x kill ses/win  r refresh  q/esc quit  ·  {refresh}"
+            "j/k window  h/l jump session  enter switch  $/, rename ses/win  X/x kill ses/win  r refresh  q/esc quit  ·  {refresh}"
         ),
         Style::default().fg(Color::DarkGray),
     ));
 
-    let paragraph = Paragraph::new(vec![title, sessions_line, help])
+    let paragraph = Paragraph::new(vec![title, help])
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = match app.current_session() {
-        Some(session) => format!(
-            "{} · {} window{}{}",
-            session.name,
-            session.window_indices.len(),
-            if session.window_indices.len() == 1 { "" } else { "s" },
-            if session.attached { " · attached" } else { "" },
-        ),
-        None => "Windows".to_string(),
-    };
+    let session_count = app.sessions.len();
+    let window_count: usize = app.sessions.iter().map(|s| s.window_indices.len()).sum();
+    let title = format!(
+        "{session_count} session{} · {window_count} window{}",
+        if session_count == 1 { "" } else { "s" },
+        if window_count == 1 { "" } else { "s" },
+    );
 
-    let items: Vec<ListItem> = match app.current_session() {
-        Some(session) => session
-            .window_indices
-            .iter()
-            .map(|&i| ListItem::new(window_item_lines(&app.entries[i], app)))
-            .collect(),
-        None => Vec::new(),
-    };
+    // One flat list grouped by session: a header per session, then its windows.
+    // `selected_row` is the list index of the currently selected window so the
+    // highlight lands on it and the view scrolls to keep it visible.
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected_row = 0usize;
+    for (si, session) in app.sessions.iter().enumerate() {
+        items.push(session_header_item(session, si == app.selected_session, &app.current));
+        for (wi, &ei) in session.window_indices.iter().enumerate() {
+            if si == app.selected_session && wi == app.selected_window {
+                selected_row = items.len();
+            }
+            items.push(ListItem::new(window_item_lines(&app.entries[ei], app)));
+        }
+    }
+
     let mut state = ListState::default();
     if !items.is_empty() {
-        state.select(Some(app.selected_window));
+        state.select(Some(selected_row));
     }
 
     let list = List::new(items)
@@ -873,6 +869,35 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// A non-selectable group header row for a session in the flat list.
+fn session_header_item<'a>(
+    session: &'a SessionGroup,
+    is_selected: bool,
+    current: &CurrentTarget,
+) -> ListItem<'a> {
+    let is_current = current.session_id.as_deref() == Some(session.id.as_str());
+    let count = session.window_indices.len();
+
+    let mut style = Style::default().add_modifier(Modifier::BOLD);
+    style = if is_current || session.attached {
+        style.fg(Color::Green)
+    } else {
+        style.fg(Color::Magenta)
+    };
+
+    let pointer = if is_selected { "▾ " } else { "  " };
+    let marker = if is_current { " *" } else { "" };
+    Line::from(vec![
+        Span::styled(pointer, Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{}{}", session.name, marker), style),
+        Span::styled(
+            format!("  ({count} window{})", if count == 1 { "" } else { "s" }),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+    .into()
 }
 
 fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
@@ -1421,6 +1446,41 @@ mod tests {
         // From the last window, `j` wraps back to the first.
         app.next_window();
         assert_eq!(app.selected_window, 0);
+    }
+
+    #[test]
+    fn window_navigation_flows_across_sessions() {
+        let options = default_options();
+        // $0 has two windows, $1 has one. Sorted by name, $0 precedes $1.
+        let mut app = test_app_with_entries(
+            &options,
+            vec![
+                test_entry("$0", "0", true),
+                test_entry("$0", "1", false),
+                test_entry("$1", "0", true),
+            ],
+        );
+        app.selected_session = 0;
+        app.selected_window = 0;
+
+        app.next_window();
+        assert_eq!((app.selected_session, app.selected_window), (0, 1));
+
+        // At the end of $0's windows, `j` flows into $1.
+        app.next_window();
+        assert_eq!((app.selected_session, app.selected_window), (1, 0));
+
+        // At the very last window, `j` wraps to the very first.
+        app.next_window();
+        assert_eq!((app.selected_session, app.selected_window), (0, 0));
+
+        // `k` from the very first wraps to the very last window of the last session.
+        app.previous_window();
+        assert_eq!((app.selected_session, app.selected_window), (1, 0));
+
+        // `k` flows back into the previous session's last window.
+        app.previous_window();
+        assert_eq!((app.selected_session, app.selected_window), (0, 1));
     }
 
     #[test]
