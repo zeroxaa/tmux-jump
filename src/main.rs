@@ -904,22 +904,6 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     let current = is_current(entry, &app.current);
     let active_output = entry.activity == Activity::Active;
 
-    let mut flags = Vec::new();
-    if current {
-        flags.push("here");
-    }
-    if active_output {
-        flags.push("running");
-    }
-    if entry.window_active {
-        flags.push("focused");
-    }
-    let flags = if flags.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", flags.join(","))
-    };
-
     let current_marker = if current {
         Span::styled(
             "●",
@@ -935,6 +919,16 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
             "▸",
             Style::default()
                 .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(" ")
+    };
+    let focused_marker = if entry.window_active {
+        Span::styled(
+            "◆",
+            Style::default()
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -958,13 +952,14 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         Span::raw(" "),
         activity_marker,
         Span::raw(" "),
+        focused_marker,
+        Span::raw(" "),
         Span::styled(
             format!("{:>3}: ", entry.window_index),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(entry.window_name.clone(), name_style),
         Span::raw(format!("  {}", entry.pane_current_path)),
-        Span::styled(flags, Style::default().fg(Color::Yellow)),
     ])];
 
     for line in tail_non_empty(&entry.preview, app.inline_lines) {
@@ -1412,6 +1407,31 @@ mod tests {
         let entry = app.selected_entry().unwrap();
 
         assert_eq!(window_item_lines(entry, &app).len(), 1);
+    }
+
+    #[test]
+    fn window_item_uses_front_markers_instead_of_trailing_status_text() {
+        let options = default_options();
+        let mut entry = test_entry("$0", "0", true);
+        entry.pane_current_path =
+            "/very/long/path/that/should/not/hide/window/status/markers".to_string();
+        entry.activity = Activity::Active;
+        let mut app = test_app_with_entries(&options, vec![entry]);
+        app.current = CurrentTarget {
+            session_id: Some("$0".to_string()),
+            window_id: Some(app.entries[0].window_id.clone()),
+        };
+
+        let row: String = window_item_lines(&app.entries[0], &app)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(row.starts_with("● ▸ ◆"));
+        assert!(!row.contains("here"));
+        assert!(!row.contains("running"));
+        assert!(!row.contains("focused"));
     }
 
     #[test]
