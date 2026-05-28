@@ -24,7 +24,7 @@ use ratatui::{
 };
 
 const SEP: char = '\u{241F}';
-const PANE_FORMAT: &str = "#{session_id}\u{241F}#{session_name}\u{241F}#{session_attached}\u{241F}#{session_activity}\u{241F}#{window_id}\u{241F}#{window_index}\u{241F}#{window_name}\u{241F}#{window_active}\u{241F}#{pane_id}\u{241F}#{pane_active}\u{241F}#{pane_current_path}";
+const PANE_FORMAT: &str = "#{session_id}\u{241F}#{session_name}\u{241F}#{session_attached}\u{241F}#{window_id}\u{241F}#{window_index}\u{241F}#{window_name}\u{241F}#{window_active}\u{241F}#{pane_id}\u{241F}#{pane_active}\u{241F}#{pane_current_path}";
 const CURRENT_FORMAT: &str = "#{session_id}\u{241F}#{window_id}";
 
 #[derive(Debug, Parser)]
@@ -104,7 +104,6 @@ struct Entry {
     session_id: String,
     session_name: String,
     session_attached: bool,
-    session_activity: u64,
     window_id: String,
     window_index: String,
     window_name: String,
@@ -200,7 +199,6 @@ struct SessionGroup {
     id: String,
     name: String,
     attached: bool,
-    activity: u64,
     /// Indices into `App::entries`, sorted by tmux window index ascending.
     window_indices: Vec<usize>,
 }
@@ -568,7 +566,6 @@ fn group_sessions(entries: &[Entry]) -> Vec<SessionGroup> {
                 id: entry.session_id.clone(),
                 name: entry.session_name.clone(),
                 attached: entry.session_attached,
-                activity: entry.session_activity,
                 window_indices: Vec::new(),
             });
         group.window_indices.push(i);
@@ -583,12 +580,9 @@ fn group_sessions(entries: &[Entry]) -> Vec<SessionGroup> {
                 .unwrap_or(u32::MAX)
         });
     }
-    sessions.sort_by(|a, b| {
-        b.attached
-            .cmp(&a.attached)
-            .then(b.activity.cmp(&a.activity))
-            .then(a.name.cmp(&b.name))
-    });
+    // Stable, predictable order: sort by session name only, so a session keeps
+    // its position regardless of attach state or recent activity.
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
     sessions
 }
 
@@ -1227,7 +1221,6 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
             session_id: row.session_id,
             session_name: row.session_name,
             session_attached: row.session_attached,
-            session_activity: row.session_activity,
             window_id: row.window_id,
             window_index: row.window_index,
             window_name: row.window_name,
@@ -1327,7 +1320,6 @@ struct PaneRow {
     session_id: String,
     session_name: String,
     session_attached: bool,
-    session_activity: u64,
     window_id: String,
     window_index: String,
     window_name: String,
@@ -1340,21 +1332,20 @@ struct PaneRow {
 impl PaneRow {
     fn parse(line: &str) -> Option<Self> {
         let fields: Vec<&str> = line.split(SEP).collect();
-        if fields.len() != 11 {
+        if fields.len() != 10 {
             return None;
         }
         Some(Self {
             session_id: fields[0].to_string(),
             session_name: fields[1].to_string(),
             session_attached: fields[2] != "0",
-            session_activity: fields[3].parse().unwrap_or(0),
-            window_id: fields[4].to_string(),
-            window_index: fields[5].to_string(),
-            window_name: fields[6].to_string(),
-            window_active: fields[7] != "0",
-            pane_id: fields[8].to_string(),
-            pane_active: fields[9] != "0",
-            pane_current_path: fields[10].to_string(),
+            window_id: fields[3].to_string(),
+            window_index: fields[4].to_string(),
+            window_name: fields[5].to_string(),
+            window_active: fields[6] != "0",
+            pane_id: fields[7].to_string(),
+            pane_active: fields[8] != "0",
+            pane_current_path: fields[9].to_string(),
         })
     }
 }
@@ -1725,6 +1716,19 @@ mod tests {
     }
 
     #[test]
+    fn sessions_sort_by_name_ignoring_attach_state() {
+        // "1" is the attached session; "0" is detached. Name still decides the
+        // order, so a session keeps its position no matter what is attached.
+        let mut entries = vec![test_entry("$1", "0", true), test_entry("$0", "0", true)];
+        entries[0].session_attached = true;
+        entries[1].session_attached = false;
+
+        let sessions = group_sessions(&entries);
+        assert_eq!(sessions[0].name, "0");
+        assert_eq!(sessions[1].name, "1");
+    }
+
+    #[test]
     fn window_navigation_wraps_at_first_and_last_window() {
         let options = default_options();
         let mut app = test_app_with_entries(
@@ -1946,7 +1950,6 @@ mod tests {
             session_id: session_id.to_string(),
             session_name: session_id.trim_start_matches('$').to_string(),
             session_attached: true,
-            session_activity: 0,
             window_id: format!("@{}-{}", session_id.trim_start_matches('$'), window_index),
             window_index: window_index.to_string(),
             window_name: "window".to_string(),
