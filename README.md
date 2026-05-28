@@ -41,6 +41,8 @@ tmux-jump --list --all-windows
 `--window-lines 10` is a shortcut for showing every tmux window with the last
 ten captured pane output lines in the right preview pane.
 Use `--refresh-seconds 0` to disable automatic refresh.
+When a pane's current directory is inside a Git worktree, `tmux-jump` shows a
+compact worktree summary in the list and full Git details in the preview pane.
 
 ## Install
 

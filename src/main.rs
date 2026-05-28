@@ -111,9 +111,71 @@ struct Entry {
     window_active: bool,
     pane_id: String,
     pane_current_path: String,
+    worktree_info: Option<GitWorktreeInfo>,
     preview: Vec<String>,
     activity: Activity,
     activity_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitWorktreeInfo {
+    kind: GitWorktreeKind,
+    top_level: String,
+    git_dir: String,
+    common_dir: String,
+    head: Option<String>,
+    branch: Option<String>,
+    upstream: Option<String>,
+    status_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitWorktreeKind {
+    Main,
+    Linked,
+}
+
+impl GitWorktreeInfo {
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            GitWorktreeKind::Main => "main",
+            GitWorktreeKind::Linked => "linked",
+        }
+    }
+
+    fn ref_label(&self) -> String {
+        if let Some(branch) = self.branch.as_deref().filter(|branch| !branch.is_empty()) {
+            return branch.to_string();
+        }
+        self.head
+            .as_deref()
+            .map(|head| format!("detached {}", short_hash(head)))
+            .unwrap_or_else(|| "no HEAD".to_string())
+    }
+
+    fn change_count(&self) -> usize {
+        self.status_lines
+            .iter()
+            .filter(|line| !line.starts_with("##"))
+            .count()
+    }
+
+    fn status_label(&self) -> String {
+        match self.change_count() {
+            0 => "clean".to_string(),
+            1 => "1 change".to_string(),
+            n => format!("{n} changes"),
+        }
+    }
+
+    fn compact_summary(&self) -> String {
+        let mut parts = vec![self.ref_label()];
+        if self.kind == GitWorktreeKind::Linked {
+            parts.push("linked".to_string());
+        }
+        parts.push(self.status_label());
+        format!("git: {}", parts.join(" · "))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -615,23 +677,33 @@ fn print_targets(options: Options) -> Result<()> {
     let entries = load_entries(options.all_windows, options.preview_lines)?;
     for entry in entries {
         let lines = tail_non_empty(&entry.preview, cmp::max(options.inline_lines, 1));
+        let worktree = entry
+            .worktree_info
+            .as_ref()
+            .map(|info| info.compact_summary())
+            .unwrap_or_default();
         if options.inline_lines <= 1 {
             let last_line = lines
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "<no output>".to_string());
             println!(
+                "{}\t{}:{}\t{}\t{}\t{}",
+                entry.session_name,
+                entry.window_index,
+                entry.window_name,
+                entry.pane_current_path,
+                worktree,
+                last_line
+            );
+        } else {
+            println!(
                 "{}\t{}:{}\t{}\t{}",
                 entry.session_name,
                 entry.window_index,
                 entry.window_name,
                 entry.pane_current_path,
-                last_line
-            );
-        } else {
-            println!(
-                "{}\t{}:{}\t{}",
-                entry.session_name, entry.window_index, entry.window_name, entry.pane_current_path
+                worktree
             );
             if lines.is_empty() {
                 println!("  <no output>");
@@ -961,6 +1033,15 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         Span::styled(entry.window_name.clone(), name_style),
         Span::raw(format!("  {}", entry.pane_current_path)),
     ])];
+    if let Some(worktree_info) = &entry.worktree_info {
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                worktree_info.compact_summary(),
+                Style::default().fg(Color::Blue),
+            ),
+        ]));
+    }
 
     for line in tail_non_empty(&entry.preview, app.inline_lines) {
         lines.push(Line::from(Span::styled(
@@ -970,6 +1051,53 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     }
 
     lines
+}
+
+fn worktree_detail_lines(info: &GitWorktreeInfo) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        labeled_line(
+            "git",
+            format!(
+                "{} worktree · {} · {}",
+                info.kind_label(),
+                info.ref_label(),
+                info.status_label()
+            ),
+        ),
+        labeled_line("root", info.top_level.clone()),
+        labeled_line("git dir", info.git_dir.clone()),
+        labeled_line("common dir", info.common_dir.clone()),
+    ];
+    if let Some(head) = &info.head {
+        lines.push(labeled_line("head", head.clone()));
+    }
+    if let Some(branch) = &info.branch {
+        lines.push(labeled_line("branch", branch.clone()));
+    }
+    if let Some(upstream) = &info.upstream {
+        lines.push(labeled_line("upstream", upstream.clone()));
+    }
+    if info.status_lines.is_empty() {
+        lines.push(labeled_line("status", "clean"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "status",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.extend(
+            info.status_lines
+                .iter()
+                .map(|line| Line::from(Span::raw(format!("  {line}")))),
+        );
+    }
+    lines
+}
+
+fn labeled_line(label: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label} "), Style::default().fg(Color::DarkGray)),
+        Span::raw(value.into()),
+    ])
 }
 
 fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -992,8 +1120,12 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Span::styled("  path ", Style::default().fg(Color::DarkGray)),
                     Span::raw(entry.pane_current_path.clone()),
                 ]),
-                Line::raw(""),
             ];
+            if let Some(worktree_info) = &entry.worktree_info {
+                lines.push(Line::raw(""));
+                lines.extend(worktree_detail_lines(worktree_info));
+            }
+            lines.push(Line::raw(""));
             lines.extend(entry.preview.iter().map(|line| Line::raw(line.clone())));
             lines
         }
@@ -1073,6 +1205,7 @@ fn is_current(entry: &Entry, current: &CurrentTarget) -> bool {
 fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
     let output = tmux_output(["list-panes", "-a", "-F", PANE_FORMAT]).context("list tmux panes")?;
     let mut entries = Vec::new();
+    let mut worktree_cache: HashMap<String, Option<GitWorktreeInfo>> = HashMap::new();
 
     for line in output.lines() {
         let Some(row) = PaneRow::parse(line) else {
@@ -1084,6 +1217,10 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
         if !all_windows && !row.window_active {
             continue;
         }
+        let worktree_info = worktree_cache
+            .entry(row.pane_current_path.clone())
+            .or_insert_with(|| git_worktree_info(&row.pane_current_path))
+            .clone();
         let preview = capture_preview(&row.pane_id, preview_lines);
         let activity_fingerprint = activity_fingerprint_of(&preview);
         entries.push(Entry {
@@ -1097,6 +1234,7 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
             window_active: row.window_active,
             pane_id: row.pane_id,
             pane_current_path: row.pane_current_path,
+            worktree_info,
             preview,
             activity: Activity::Unknown,
             activity_fingerprint,
@@ -1108,6 +1246,80 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
     }
 
     Ok(entries)
+}
+
+fn git_worktree_info(path: &str) -> Option<GitWorktreeInfo> {
+    if git_output(path, &["rev-parse", "--is-inside-work-tree"]).ok()? != "true" {
+        return None;
+    }
+
+    let top_level = git_output(path, &["rev-parse", "--show-toplevel"]).ok()?;
+    let git_dir = git_output(path, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    let common_dir = git_output(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|_| git_output(path, &["rev-parse", "--git-common-dir"]))
+    .ok()?;
+    let kind = if git_dir == common_dir {
+        GitWorktreeKind::Main
+    } else {
+        GitWorktreeKind::Linked
+    };
+    let head = git_output(path, &["rev-parse", "--verify", "HEAD"])
+        .ok()
+        .filter(|head| !head.is_empty());
+    let branch = git_output(path, &["branch", "--show-current"])
+        .ok()
+        .filter(|branch| !branch.is_empty());
+    let upstream = git_output(
+        path,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()
+    .filter(|upstream| !upstream.is_empty());
+    let status_lines = git_output(path, &["status", "--short", "--branch"])
+        .map(|output| output.lines().map(ToString::to_string).collect())
+        .unwrap_or_default();
+
+    Some(GitWorktreeInfo {
+        kind,
+        top_level,
+        git_dir,
+        common_dir,
+        head,
+        branch,
+        upstream,
+        status_lines,
+    })
+}
+
+fn git_output(path: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("run git -C {path} {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 #[derive(Debug)]
@@ -1435,6 +1647,68 @@ mod tests {
     }
 
     #[test]
+    fn worktree_summary_omits_main_worktree_label() {
+        let mut info = test_worktree_info();
+        info.kind = GitWorktreeKind::Main;
+
+        assert_eq!(info.compact_summary(), "git: feature · 2 changes");
+    }
+
+    #[test]
+    fn worktree_summary_marks_linked_worktrees() {
+        let info = test_worktree_info();
+
+        assert_eq!(info.compact_summary(), "git: feature · linked · 2 changes");
+    }
+
+    #[test]
+    fn window_item_puts_worktree_summary_on_separate_line() {
+        let options = default_options();
+        let mut entry = test_entry("$0", "0", true);
+        entry.worktree_info = Some(test_worktree_info());
+        let app = test_app_with_entries(&options, vec![entry]);
+        let lines = window_item_lines(&app.entries[0], &app);
+
+        let first_row: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let second_row: String = lines[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(!first_row.contains("git:"));
+        assert_eq!(second_row, "      git: feature · linked · 2 changes");
+    }
+
+    #[test]
+    fn worktree_detail_lines_show_git_paths_and_status() {
+        let info = test_worktree_info();
+        let rendered: Vec<String> = worktree_detail_lines(&info)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("linked worktree")));
+        assert!(rendered.iter().any(|line| line == "root /repo"));
+        assert!(rendered.iter().any(|line| line == "common dir /repo/.git"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "upstream origin/feature")
+        );
+        assert!(rendered.iter().any(|line| line == "  ?? README.md"));
+    }
+
+    #[test]
     fn tail_non_empty_returns_last_non_empty_lines() {
         let lines = vec![
             "first".to_string(),
@@ -1679,9 +1953,27 @@ mod tests {
             window_active,
             pane_id: format!("%{}-{}", session_id.trim_start_matches('$'), window_index),
             pane_current_path: "/tmp".to_string(),
+            worktree_info: None,
             preview: Vec::new(),
             activity: Activity::Unknown,
             activity_fingerprint: String::new(),
+        }
+    }
+
+    fn test_worktree_info() -> GitWorktreeInfo {
+        GitWorktreeInfo {
+            kind: GitWorktreeKind::Linked,
+            top_level: "/repo".to_string(),
+            git_dir: "/repo/.git/worktrees/feature".to_string(),
+            common_dir: "/repo/.git".to_string(),
+            head: Some("1234567890abcdef".to_string()),
+            branch: Some("feature".to_string()),
+            upstream: Some("origin/feature".to_string()),
+            status_lines: vec![
+                "## feature...origin/feature".to_string(),
+                " M src/main.rs".to_string(),
+                "?? README.md".to_string(),
+            ],
         }
     }
 
