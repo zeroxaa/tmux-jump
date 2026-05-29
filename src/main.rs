@@ -173,7 +173,18 @@ impl GitWorktreeInfo {
             parts.push("linked".to_string());
         }
         parts.push(self.status_label());
-        format!("git: {}", parts.join(" · "))
+        parts.join(" · ")
+    }
+
+    /// Tightest possible label for inline rendering in the picker's left list:
+    /// just the branch (or detached/no-HEAD label), plus `+N` when there are
+    /// uncommitted changes. Full status + linked marker live in the preview.
+    fn inline_label(&self) -> String {
+        let r = self.ref_label();
+        match self.change_count() {
+            0 => r,
+            n => format!("{r} +{n}"),
+        }
     }
 }
 
@@ -245,6 +256,7 @@ struct App {
     current: CurrentTarget,
     status: Option<String>,
     probe: Option<Receiver<ActivityProbeResult>>,
+    worktree_probe: Option<Receiver<WorktreeProbeResult>>,
     rename: Option<RenameState>,
     confirm_kill: Option<KillState>,
 }
@@ -254,6 +266,7 @@ impl App {
         let current = current_target();
         let entries = load_entries(true, options.preview_lines)?;
         let probe = spawn_activity_probe(&entries, &options);
+        let worktree_probe = spawn_worktree_probe(&entries);
         let sessions = group_sessions(&entries);
         let (selected_session, selected_window) = initial_position(&sessions, &entries, &current);
         Ok(Self {
@@ -267,6 +280,7 @@ impl App {
             current,
             status: None,
             probe,
+            worktree_probe,
             rename: None,
             confirm_kill: None,
         })
@@ -300,6 +314,30 @@ impl App {
         }
     }
 
+    /// Drain any completed background git-worktree probe and fan its
+    /// path-keyed results into every entry whose pane lives at that path.
+    fn poll_worktree_probe(&mut self) -> bool {
+        let Some(rx) = &self.worktree_probe else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                for entry in &mut self.entries {
+                    if let Some(info) = result.by_path.get(&entry.pane_current_path) {
+                        entry.worktree_info = info.clone();
+                    }
+                }
+                self.worktree_probe = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.worktree_probe = None;
+                false
+            }
+        }
+    }
+
     fn refresh(&mut self) {
         self.refresh_with_status("refreshed");
     }
@@ -309,9 +347,10 @@ impl App {
     }
 
     fn refresh_with_status(&mut self, status: &str) {
-        // Discard any in-flight startup probe — refresh data is fresher and the
-        // probe's fingerprints would clobber the post-refresh state.
+        // Discard any in-flight startup probes — refresh data is fresher and
+        // the probes' results would clobber the post-refresh state.
         self.probe = None;
+        self.worktree_probe = None;
         let prev_session_id = self
             .sessions
             .get(self.selected_session)
@@ -322,11 +361,24 @@ impl App {
             .iter()
             .map(|e| (e.pane_id.clone(), e.activity_fingerprint.clone()))
             .collect();
+        // Keep the previous git info per path so the list doesn't flash blank
+        // while the new probe runs; the probe will overwrite each entry shortly.
+        let prev_worktree: HashMap<String, Option<GitWorktreeInfo>> = self
+            .entries
+            .iter()
+            .map(|e| (e.pane_current_path.clone(), e.worktree_info.clone()))
+            .collect();
 
         match load_entries(true, self.preview_lines) {
             Ok(mut entries) => {
                 apply_activity(&mut entries, &prev_fingerprints);
+                for entry in &mut entries {
+                    if let Some(info) = prev_worktree.get(&entry.pane_current_path) {
+                        entry.worktree_info = info.clone();
+                    }
+                }
                 let sessions = group_sessions(&entries);
+                self.worktree_probe = spawn_worktree_probe(&entries);
                 self.entries = entries;
                 self.sessions = sessions;
                 self.selected_session = prev_session_id
@@ -668,7 +720,18 @@ fn main() -> Result<()> {
 }
 
 fn print_targets(options: Options) -> Result<()> {
-    let entries = load_entries(options.all_windows, options.preview_lines)?;
+    let mut entries = load_entries(options.all_windows, options.preview_lines)?;
+    // `--list` has no event loop to poll the worktree probe in the background,
+    // so block on it once before printing to keep the worktree column populated.
+    if let Some(rx) = spawn_worktree_probe(&entries)
+        && let Ok(result) = rx.recv()
+    {
+        for entry in &mut entries {
+            if let Some(info) = result.by_path.get(&entry.pane_current_path) {
+                entry.worktree_info = info.clone();
+            }
+        }
+    }
     for entry in entries {
         let lines = tail_non_empty(&entry.preview, cmp::max(options.inline_lines, 1));
         let worktree = entry
@@ -719,6 +782,7 @@ fn run_picker(options: Options) -> Result<Option<Entry>> {
 
     loop {
         app.poll_probe();
+        app.poll_worktree_probe();
         tui.draw(&app)?;
 
         if event::poll(poll_timeout(refresh_interval, last_refresh))
@@ -846,7 +910,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vertical[1]);
 
     render_header(frame, vertical[0], app);
@@ -1013,7 +1077,7 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         Style::default().add_modifier(Modifier::BOLD)
     };
 
-    let mut lines = vec![Line::from(vec![
+    let mut row_spans = vec![
         current_marker,
         Span::raw(" "),
         activity_marker,
@@ -1026,16 +1090,18 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         ),
         Span::styled(entry.window_name.clone(), name_style),
         Span::raw(format!("  {}", entry.pane_current_path)),
-    ])];
+    ];
     if let Some(worktree_info) = &entry.worktree_info {
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                worktree_info.compact_summary(),
-                Style::default().fg(Color::Blue),
-            ),
-        ]));
+        row_spans.push(Span::styled(
+            "  · ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        row_spans.push(Span::styled(
+            worktree_info.inline_label(),
+            Style::default().fg(Color::Blue),
+        ));
     }
+    let mut lines = vec![Line::from(row_spans)];
 
     for line in tail_non_empty(&entry.preview, app.inline_lines) {
         lines.push(Line::from(Span::styled(
@@ -1199,7 +1265,6 @@ fn is_current(entry: &Entry, current: &CurrentTarget) -> bool {
 fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
     let output = tmux_output(["list-panes", "-a", "-F", PANE_FORMAT]).context("list tmux panes")?;
     let mut entries = Vec::new();
-    let mut worktree_cache: HashMap<String, Option<GitWorktreeInfo>> = HashMap::new();
 
     for line in output.lines() {
         let Some(row) = PaneRow::parse(line) else {
@@ -1211,12 +1276,10 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
         if !all_windows && !row.window_active {
             continue;
         }
-        let worktree_info = worktree_cache
-            .entry(row.pane_current_path.clone())
-            .or_insert_with(|| git_worktree_info(&row.pane_current_path))
-            .clone();
         let preview = capture_preview(&row.pane_id, preview_lines);
         let activity_fingerprint = activity_fingerprint_of(&preview);
+        // `worktree_info` is filled in asynchronously by `spawn_worktree_probe`
+        // so the picker can draw immediately instead of waiting on git.
         entries.push(Entry {
             session_id: row.session_id,
             session_name: row.session_name,
@@ -1227,7 +1290,7 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
             window_active: row.window_active,
             pane_id: row.pane_id,
             pane_current_path: row.pane_current_path,
-            worktree_info,
+            worktree_info: None,
             preview,
             activity: Activity::Unknown,
             activity_fingerprint,
@@ -1469,6 +1532,41 @@ fn spawn_activity_probe(
     Some(rx)
 }
 
+struct WorktreeProbeResult {
+    /// `git_worktree_info` keyed by pane current path. `None` value means the
+    /// path is not inside a git worktree (still a recorded answer, so we don't
+    /// keep re-probing it on every refresh).
+    by_path: HashMap<String, Option<GitWorktreeInfo>>,
+}
+
+/// Spawn a background thread that runs `git_worktree_info` once per unique
+/// pane path and sends the path-keyed results over a channel. Returns `None`
+/// when there is nothing to probe.
+///
+/// Running off-thread matters because `git_worktree_info` forks ~8 git
+/// processes per path; doing this synchronously in `load_entries` used to
+/// noticeably delay the first frame.
+fn spawn_worktree_probe(entries: &[Entry]) -> Option<Receiver<WorktreeProbeResult>> {
+    let mut paths: Vec<String> = entries.iter().map(|e| e.pane_current_path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return None;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut by_path = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let info = git_worktree_info(&path);
+            by_path.insert(path, info);
+        }
+        let _ = tx.send(WorktreeProbeResult { by_path });
+    });
+
+    Some(rx)
+}
+
 fn switch_to(entry: &Entry) -> Result<()> {
     tmux_status(["select-window", "-t", entry.window_id.as_str()])
         .with_context(|| format!("select tmux window {}", entry.window_id))?;
@@ -1642,37 +1740,35 @@ mod tests {
         let mut info = test_worktree_info();
         info.kind = GitWorktreeKind::Main;
 
-        assert_eq!(info.compact_summary(), "git: feature · 2 changes");
+        assert_eq!(info.compact_summary(), "feature · 2 changes");
     }
 
     #[test]
     fn worktree_summary_marks_linked_worktrees() {
         let info = test_worktree_info();
 
-        assert_eq!(info.compact_summary(), "git: feature · linked · 2 changes");
+        assert_eq!(info.compact_summary(), "feature · linked · 2 changes");
     }
 
     #[test]
-    fn window_item_puts_worktree_summary_on_separate_line() {
+    fn window_item_appends_worktree_label_inline() {
         let options = default_options();
         let mut entry = test_entry("$0", "0", true);
         entry.worktree_info = Some(test_worktree_info());
         let app = test_app_with_entries(&options, vec![entry]);
         let lines = window_item_lines(&app.entries[0], &app);
 
-        let first_row: String = lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        let second_row: String = lines[1]
+        let row: String = lines[0]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
 
-        assert!(!first_row.contains("git:"));
-        assert_eq!(second_row, "      git: feature · linked · 2 changes");
+        // Single row, no separate "git: …" line. The inline label drops the
+        // "git:" prefix and the "linked" / "clean" filler — just branch + count.
+        assert_eq!(lines.len(), 1);
+        assert!(!row.contains("git:"));
+        assert!(row.contains("· feature +2"));
     }
 
     #[test]
@@ -1940,6 +2036,7 @@ mod tests {
             current: CurrentTarget::default(),
             status: None,
             probe: None,
+            worktree_probe: None,
             rename: None,
             confirm_kill: None,
         }
