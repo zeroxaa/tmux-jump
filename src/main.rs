@@ -1,20 +1,25 @@
 use std::{
     cmp,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
+    future::Future,
     io::{self, Stdout},
-    process::{Command, Stdio},
+    path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use crossterm::{
+    cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -22,15 +27,20 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
+use rmux_proto::{
+    DisplayMessageRequest, KillSessionRequest, KillWindowRequest, ListWindowsRequest,
+    RenameSessionRequest, RenameWindowRequest, Request, Response, SelectWindowRequest, SessionName,
+    SwitchClientExt3Request, Target, WindowListEntry, WindowTarget,
+};
+use rmux_sdk::{PaneId, Rmux, RmuxEndpoint};
 
 const SEP: char = '\u{241F}';
-const PANE_FORMAT: &str = "#{session_id}\u{241F}#{session_name}\u{241F}#{session_attached}\u{241F}#{session_activity}\u{241F}#{window_id}\u{241F}#{window_index}\u{241F}#{window_name}\u{241F}#{window_active}\u{241F}#{pane_id}\u{241F}#{pane_active}\u{241F}#{pane_current_path}";
 const CURRENT_FORMAT: &str = "#{session_id}\u{241F}#{window_id}";
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Fast tmux session/window picker")]
+#[command(author, version, about = "Fast RMUX session/window picker")]
 struct Cli {
-    /// Show one row per tmux window instead of one row per session.
+    /// Show one row per RMUX window instead of one row per session.
     #[arg(short = 'w', long)]
     all_windows: bool,
 
@@ -65,7 +75,7 @@ struct Cli {
     list: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Options {
     all_windows: bool,
     preview_lines: usize,
@@ -107,9 +117,11 @@ struct Entry {
     session_activity: u64,
     window_id: String,
     window_index: String,
+    window_index_num: u32,
     window_name: String,
     window_active: bool,
     pane_id: String,
+    pane_id_num: u32,
     pane_current_path: String,
     preview: Vec<String>,
     activity: Activity,
@@ -139,7 +151,7 @@ struct SessionGroup {
     name: String,
     attached: bool,
     activity: u64,
-    /// Indices into `App::entries`, sorted by tmux window index ascending.
+    /// Indices into `App::entries`, sorted by RMUX window index ascending.
     window_indices: Vec<usize>,
 }
 
@@ -190,7 +202,7 @@ struct App {
 }
 
 impl App {
-    fn load(options: Options) -> Result<Self> {
+    fn load(options: &Options) -> Result<Self> {
         let current = current_target();
         let entries = load_entries(true, options.preview_lines)?;
         let probe = spawn_activity_probe(&entries, &options);
@@ -358,7 +370,7 @@ impl App {
         if let Some(session) = self.current_session() {
             self.rename = Some(RenameState {
                 kind: RenameKind::Session,
-                target_id: session.id.clone(),
+                target_id: session.name.clone(),
                 original: session.name.clone(),
                 buffer: session.name.clone(),
             });
@@ -369,7 +381,7 @@ impl App {
         if let Some(entry) = self.selected_entry() {
             self.rename = Some(RenameState {
                 kind: RenameKind::Window,
-                target_id: entry.window_id.clone(),
+                target_id: window_target_string(entry),
                 original: entry.window_name.clone(),
                 buffer: entry.window_name.clone(),
             });
@@ -404,12 +416,8 @@ impl App {
             return;
         }
         let result = match rename.kind {
-            RenameKind::Session => {
-                tmux_status(["rename-session", "-t", rename.target_id.as_str(), new_name])
-            }
-            RenameKind::Window => {
-                tmux_status(["rename-window", "-t", rename.target_id.as_str(), new_name])
-            }
+            RenameKind::Session => rename_session(&rename.target_id, new_name),
+            RenameKind::Window => rename_window(&rename.target_id, new_name),
         };
         match result {
             Ok(()) => {
@@ -429,7 +437,7 @@ impl App {
         if let Some(entry) = self.selected_entry() {
             self.confirm_kill = Some(KillState {
                 kind: KillKind::Window,
-                target_id: entry.window_id.clone(),
+                target_id: window_target_string(entry),
                 label: format!("{}: {}", entry.window_index, entry.window_name),
             });
         }
@@ -439,7 +447,7 @@ impl App {
         if let Some(session) = self.current_session() {
             self.confirm_kill = Some(KillState {
                 kind: KillKind::Session,
-                target_id: session.id.clone(),
+                target_id: session.name.clone(),
                 label: session.name.clone(),
             });
         }
@@ -456,8 +464,8 @@ impl App {
             return;
         };
         let result = match kill.kind {
-            KillKind::Session => tmux_status(["kill-session", "-t", kill.target_id.as_str()]),
-            KillKind::Window => tmux_status(["kill-window", "-t", kill.target_id.as_str()]),
+            KillKind::Session => kill_session(&kill.target_id),
+            KillKind::Window => kill_window(&kill.target_id),
         };
         match result {
             Ok(()) => {
@@ -491,12 +499,9 @@ fn group_sessions(entries: &[Entry]) -> Vec<SessionGroup> {
 
     let mut sessions: Vec<SessionGroup> = map.into_values().collect();
     for session in &mut sessions {
-        session.window_indices.sort_by_key(|&i| {
-            entries[i]
-                .window_index
-                .parse::<u32>()
-                .unwrap_or(u32::MAX)
-        });
+        session
+            .window_indices
+            .sort_by_key(|&i| entries[i].window_index.parse::<u32>().unwrap_or(u32::MAX));
     }
     sessions.sort_by(|a, b| {
         b.attached
@@ -548,10 +553,15 @@ impl Tui {
     fn new() -> Result<Self> {
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )
+        .context("enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend).context("create terminal backend")?;
-        terminal.clear().context("clear terminal")?;
+        let terminal = Terminal::new(backend).context("create terminal backend")?;
         Ok(Self { terminal })
     }
 
@@ -575,11 +585,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let options = cli.options();
     if cli.list {
-        print_targets(options)?;
+        print_targets(&options)?;
         return Ok(());
     }
 
-    let target = run_picker(options)?;
+    let target = run_picker(&options)?;
 
     if let Some(entry) = target {
         switch_to(&entry)?;
@@ -588,7 +598,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_targets(options: Options) -> Result<()> {
+fn print_targets(options: &Options) -> Result<()> {
     let entries = load_entries(options.all_windows, options.preview_lines)?;
     for entry in entries {
         let lines = tail_non_empty(&entry.preview, cmp::max(options.inline_lines, 1));
@@ -622,7 +632,7 @@ fn print_targets(options: Options) -> Result<()> {
     Ok(())
 }
 
-fn run_picker(options: Options) -> Result<Option<Entry>> {
+fn run_picker(options: &Options) -> Result<Option<Entry>> {
     let mut app = App::load(options)?;
     let mut tui = Tui::new()?;
     let refresh_interval = refresh_interval(options.refresh_seconds);
@@ -685,7 +695,11 @@ fn handle_rename_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.cancel_rename(),
         KeyCode::Backspace => app.rename_backspace(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_rename(),
-        KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             app.rename_input(c);
         }
         _ => {}
@@ -784,7 +798,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_default();
 
     let title = Line::from(vec![
-        Span::styled("tmux-jump", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("rmux-jump", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         summary,
         Span::styled(current_session, Style::default().fg(Color::DarkGray)),
@@ -805,18 +819,13 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD);
         } else if is_current {
-            style = style
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD);
+            style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
         } else if session.attached {
             style = style.fg(Color::Green);
         }
 
         let marker = if is_current { "*" } else { "" };
-        strip.push(Span::styled(
-            format!(" {}{} ", session.name, marker),
-            style,
-        ));
+        strip.push(Span::styled(format!(" {}{} ", session.name, marker), style));
         strip.push(Span::raw(" "));
     }
     let sessions_line = Line::from(strip);
@@ -844,7 +853,11 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "{} · {} window{}{}",
             session.name,
             session.window_indices.len(),
-            if session.window_indices.len() == 1 { "" } else { "s" },
+            if session.window_indices.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
             if session.attached { " · attached" } else { "" },
         ),
         None => "Windows".to_string(),
@@ -977,7 +990,7 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines.extend(entry.preview.iter().map(|line| Line::raw(line.clone())));
             lines
         }
-        None => vec![Line::raw("No tmux targets found.")],
+        None => vec![Line::raw("No RMUX targets found.")],
     };
 
     let paragraph = Paragraph::new(lines)
@@ -999,7 +1012,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
             Span::styled(
                 format!("\"{}\"?", kill.label),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "   y confirm · n cancel",
@@ -1018,7 +1033,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let line = Line::from(vec![
             Span::styled(
                 format!("rename {what} "),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("\"{}\" → ", rename.original),
@@ -1026,7 +1043,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
             Span::styled(
                 rename.buffer.clone(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("▏", Style::default().fg(Color::Yellow)),
             Span::styled(
@@ -1041,7 +1060,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let text = app
         .status
         .as_deref()
-        .unwrap_or("Run inside tmux for switch-client; outside tmux this will attach.");
+        .unwrap_or("Run inside RMUX to switch clients.");
     frame.render_widget(Paragraph::new(text), area);
 }
 
@@ -1051,32 +1070,65 @@ fn is_current(entry: &Entry, current: &CurrentTarget) -> bool {
 }
 
 fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
-    let output = tmux_output(["list-panes", "-a", "-F", PANE_FORMAT]).context("list tmux panes")?;
+    run_rmux(load_entries_async(all_windows, preview_lines))
+}
+
+#[derive(Debug, Clone)]
+struct WindowRuntimeInfo {
+    id: String,
+    name: String,
+    active: bool,
+    active_pane_id: Option<PaneId>,
+}
+
+async fn load_entries_async(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
+    let rmux = connect_rmux().await?;
+    let discovered = rmux
+        .find_panes()
+        .all()
+        .await
+        .context("discover RMUX panes")?;
+    let windows = load_window_runtime_info(&rmux, &discovered).await?;
     let mut entries = Vec::new();
 
-    for line in output.lines() {
-        let Some(row) = PaneRow::parse(line) else {
+    for pane in discovered {
+        let session_name = pane.session_name.as_str().to_string();
+        let key = (session_name.clone(), pane.window_index);
+        let Some(window) = windows.get(&key) else {
             continue;
         };
-        if !row.pane_active {
+        if window.active_pane_id != Some(pane.pane_id) {
             continue;
         }
-        if !all_windows && !row.window_active {
+        if !all_windows && !window.active {
             continue;
         }
-        let preview = capture_preview(&row.pane_id, preview_lines);
+
+        let info = pane.pane.info().await.with_context(|| {
+            format!(
+                "read RMUX pane info for {}:{}",
+                pane.session_name, pane.window_index
+            )
+        })?;
+        let session_info = info.session(pane.session_id);
+        let preview = match capture_preview_from_pane(&pane.pane, preview_lines).await {
+            Ok(preview) => preview,
+            Err(err) => vec![format!("failed to capture pane: {err:#}")],
+        };
         let activity_fingerprint = activity_fingerprint_of(&preview);
         entries.push(Entry {
-            session_id: row.session_id,
-            session_name: row.session_name,
-            session_attached: row.session_attached,
-            session_activity: row.session_activity,
-            window_id: row.window_id,
-            window_index: row.window_index,
-            window_name: row.window_name,
-            window_active: row.window_active,
-            pane_id: row.pane_id,
-            pane_current_path: row.pane_current_path,
+            session_id: pane.session_id.to_string(),
+            session_name,
+            session_attached: session_info.is_some_and(|info| info.attached_clients > 0),
+            session_activity: session_info.map(|info| info.generation).unwrap_or_default(),
+            window_id: window.id.clone(),
+            window_index: pane.window_index.to_string(),
+            window_index_num: pane.window_index,
+            window_name: window.name.clone(),
+            window_active: window.active,
+            pane_id: pane.pane_id.to_string(),
+            pane_id_num: pane.pane_id.as_u32(),
+            pane_current_path: pane.working_directory.unwrap_or_else(|| "-".to_string()),
             preview,
             activity: Activity::Unknown,
             activity_fingerprint,
@@ -1084,70 +1136,99 @@ fn load_entries(all_windows: bool, preview_lines: usize) -> Result<Vec<Entry>> {
     }
 
     if entries.is_empty() {
-        bail!("no tmux sessions/windows found");
+        bail!("no RMUX sessions/windows found");
     }
 
     Ok(entries)
 }
 
-#[derive(Debug)]
-struct PaneRow {
-    session_id: String,
-    session_name: String,
-    session_attached: bool,
-    session_activity: u64,
-    window_id: String,
-    window_index: String,
-    window_name: String,
-    window_active: bool,
-    pane_id: String,
-    pane_active: bool,
-    pane_current_path: String,
-}
+async fn load_window_runtime_info(
+    rmux: &Rmux,
+    panes: &[rmux_sdk::DiscoveredPane],
+) -> Result<HashMap<(String, u32), WindowRuntimeInfo>> {
+    let session_names: HashSet<String> = panes
+        .iter()
+        .map(|pane| pane.session_name.as_str().to_string())
+        .collect();
+    let mut windows = HashMap::new();
 
-impl PaneRow {
-    fn parse(line: &str) -> Option<Self> {
-        let fields: Vec<&str> = line.split(SEP).collect();
-        if fields.len() != 11 {
-            return None;
+    for name in session_names {
+        let session_name = rmux_session_name(&name)?;
+        let session = rmux
+            .session(session_name.clone())
+            .await
+            .with_context(|| format!("open RMUX session handle for {name}"))?;
+        for window in list_windows_for_session(&session_name)? {
+            let index = window.target.window_index();
+            let active_pane_id = session
+                .window(index)
+                .panes()
+                .await
+                .with_context(|| format!("list RMUX panes for {name}:{index}"))?
+                .into_iter()
+                .find(|pane| pane.active)
+                .map(|pane| pane.id);
+            windows.insert(
+                (name.clone(), index),
+                WindowRuntimeInfo {
+                    id: window.window_id,
+                    name: window.name.unwrap_or_else(|| "window".to_string()),
+                    active: window.active,
+                    active_pane_id,
+                },
+            );
         }
-        Some(Self {
-            session_id: fields[0].to_string(),
-            session_name: fields[1].to_string(),
-            session_attached: fields[2] != "0",
-            session_activity: fields[3].parse().unwrap_or(0),
-            window_id: fields[4].to_string(),
-            window_index: fields[5].to_string(),
-            window_name: fields[6].to_string(),
-            window_active: fields[7] != "0",
-            pane_id: fields[8].to_string(),
-            pane_active: fields[9] != "0",
-            pane_current_path: fields[10].to_string(),
-        })
     }
+
+    Ok(windows)
 }
 
 fn current_target() -> CurrentTarget {
-    if env::var_os("TMUX").is_none() {
-        return CurrentTarget::default();
-    }
-
-    let Ok(output) = tmux_output(["display-message", "-p", CURRENT_FORMAT]) else {
+    if env::var_os("RMUX").is_none() {
         return CurrentTarget::default();
     };
-    let mut parts = output.trim().split(SEP);
-    CurrentTarget {
-        session_id: parts.next().map(str::to_string),
-        window_id: parts.next().map(str::to_string),
+
+    match display_message(CURRENT_FORMAT) {
+        Ok(output) => {
+            let mut parts = output.trim().split(SEP);
+            CurrentTarget {
+                session_id: parts.next().map(str::to_string),
+                window_id: parts.next().map(str::to_string),
+            }
+        }
+        Err(_) => CurrentTarget::default(),
     }
 }
 
-fn capture_preview(pane_id: &str, lines: usize) -> Vec<String> {
-    let start = format!("-{}", cmp::max(lines, 1));
-    match tmux_output(["capture-pane", "-p", "-J", "-t", pane_id, "-S", &start]) {
-        Ok(output) => output.lines().map(clean_line).collect(),
-        Err(err) => vec![format!("failed to capture pane: {err:#}")],
+async fn capture_preview_from_pane(pane: &rmux_sdk::Pane, lines: usize) -> Result<Vec<String>> {
+    let capture = pane
+        .screenshot()
+        .await
+        .context("capture RMUX pane snapshot")?;
+    Ok(last_lines(
+        capture.text.lines().map(clean_line).collect(),
+        cmp::max(lines, 1),
+    ))
+}
+
+async fn capture_preview_by_id(
+    rmux: &Rmux,
+    session_name: &str,
+    pane_id: u32,
+    lines: usize,
+) -> Result<Vec<String>> {
+    let pane = rmux
+        .pane_by_id(rmux_session_name(session_name)?, PaneId::new(pane_id))
+        .await
+        .with_context(|| format!("open RMUX pane handle for {session_name}:%{pane_id}"))?;
+    capture_preview_from_pane(&pane, lines).await
+}
+
+fn last_lines(mut lines: Vec<String>, count: usize) -> Vec<String> {
+    if lines.len() > count {
+        lines.drain(..lines.len() - count);
     }
+    lines
 }
 
 /// Fingerprint a pane's captured content for activity detection. Uses the full
@@ -1198,7 +1279,10 @@ fn spawn_activity_probe(
         return None;
     }
 
-    let pane_ids: Vec<String> = entries.iter().map(|e| e.pane_id.clone()).collect();
+    let panes: Vec<(String, u32, String)> = entries
+        .iter()
+        .map(|e| (e.session_name.clone(), e.pane_id_num, e.pane_id.clone()))
+        .collect();
     let initial_fingerprints: HashMap<String, String> = entries
         .iter()
         .map(|e| (e.pane_id.clone(), e.activity_fingerprint.clone()))
@@ -1210,13 +1294,30 @@ fn spawn_activity_probe(
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut any_change: HashMap<String, bool> =
-            pane_ids.iter().map(|id| (id.clone(), false)).collect();
+            panes.iter().map(|(_, _, id)| (id.clone(), false)).collect();
         let mut latest = initial_fingerprints.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
+        let rmux = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.block_on(connect_rmux()).ok());
 
         for _ in 1..samples {
             thread::sleep(interval);
-            for pane_id in &pane_ids {
-                let preview = capture_preview(pane_id, preview_lines);
+            for (session_name, pane_id_num, pane_id) in &panes {
+                let preview = match (&runtime, &rmux) {
+                    (Some(runtime), Some(rmux)) => runtime
+                        .block_on(capture_preview_by_id(
+                            rmux,
+                            session_name,
+                            *pane_id_num,
+                            preview_lines,
+                        ))
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
                 let fp = activity_fingerprint_of(&preview);
                 if let Some(prev_fp) = latest.get(pane_id) {
                     if *prev_fp != fp {
@@ -1232,7 +1333,14 @@ fn spawn_activity_probe(
         let activity = any_change
             .into_iter()
             .map(|(id, changed)| {
-                (id, if changed { Activity::Active } else { Activity::Idle })
+                (
+                    id,
+                    if changed {
+                        Activity::Active
+                    } else {
+                        Activity::Idle
+                    },
+                )
             })
             .collect();
 
@@ -1247,48 +1355,194 @@ fn spawn_activity_probe(
 }
 
 fn switch_to(entry: &Entry) -> Result<()> {
-    tmux_status(["select-window", "-t", entry.window_id.as_str()])
-        .with_context(|| format!("select tmux window {}", entry.window_id))?;
+    let target = window_target_for_entry(entry)?;
+    expect_response(
+        rmux_roundtrip(Request::SelectWindow(SelectWindowRequest {
+            target: target.clone(),
+        }))?,
+        "select-window",
+    )?;
 
-    if env::var_os("TMUX").is_some() {
-        tmux_status(["switch-client", "-t", entry.session_id.as_str()])
-            .with_context(|| format!("switch to tmux session {}", entry.session_name))?;
+    let current = current_target();
+    if current.session_id.as_deref() == Some(entry.session_id.as_str()) {
+        return Ok(());
+    }
+
+    if env::var_os("RMUX").is_none() {
+        bail!("run inside RMUX to switch clients");
+    }
+
+    expect_response(
+        rmux_roundtrip(Request::SwitchClientExt3(SwitchClientExt3Request {
+            target_client: None,
+            target: Some(window_target_string(entry)),
+            key_table: None,
+            last_session: false,
+            next_session: false,
+            previous_session: false,
+            toggle_read_only: false,
+            sort_order: None,
+            skip_environment_update: false,
+            zoom: false,
+        }))?,
+        "switch-client",
+    )
+}
+
+fn rename_session(target: &str, new_name: &str) -> Result<()> {
+    expect_response(
+        rmux_roundtrip(Request::RenameSession(RenameSessionRequest {
+            target: rmux_session_name(target)?,
+            new_name: rmux_session_name(new_name)?,
+        }))?,
+        "rename-session",
+    )
+}
+
+fn rename_window(target: &str, new_name: &str) -> Result<()> {
+    expect_response(
+        rmux_roundtrip(Request::RenameWindow(RenameWindowRequest {
+            target: parse_window_target(target)?,
+            name: new_name.to_string(),
+        }))?,
+        "rename-window",
+    )
+}
+
+fn kill_session(target: &str) -> Result<()> {
+    expect_response(
+        rmux_roundtrip(Request::KillSession(KillSessionRequest {
+            target: rmux_session_name(target)?,
+            kill_all_except_target: false,
+            clear_alerts: false,
+        }))?,
+        "kill-session",
+    )
+}
+
+fn kill_window(target: &str) -> Result<()> {
+    expect_response(
+        rmux_roundtrip(Request::KillWindow(KillWindowRequest {
+            target: parse_window_target(target)?,
+            kill_all_others: false,
+        }))?,
+        "kill-window",
+    )
+}
+
+fn display_message(message: &str) -> Result<String> {
+    match rmux_roundtrip(Request::DisplayMessage(DisplayMessageRequest {
+        target: None,
+        print: true,
+        message: Some(message.to_string()),
+        empty_target_context: false,
+    }))? {
+        Response::DisplayMessage(response) => response
+            .command_output()
+            .map(|output| String::from_utf8_lossy(output.stdout()).to_string())
+            .ok_or_else(|| anyhow!("RMUX display-message returned no output")),
+        response => unexpected_response("display-message", response),
+    }
+}
+
+fn list_windows_for_session(session_name: &SessionName) -> Result<Vec<WindowListEntry>> {
+    match rmux_roundtrip(Request::ListWindows(ListWindowsRequest {
+        target: session_name.clone(),
+        format: None,
+    }))? {
+        Response::ListWindows(response) => Ok(response.windows),
+        response => unexpected_response("list-windows", response),
+    }
+}
+
+fn rmux_roundtrip(request: Request) -> Result<Response> {
+    let socket_path = rmux_socket_path()?;
+    let mut connection = rmux_client::connect(&socket_path)
+        .with_context(|| format!("connect to RMUX daemon at {}", socket_path.display()))?;
+    match connection
+        .roundtrip(&request)
+        .with_context(|| format!("send RMUX {} request", request.command_name()))?
+    {
+        Response::Error(error) => Err(anyhow!(error.error)),
+        response => Ok(response),
+    }
+}
+
+fn expect_response(response: Response, expected: &'static str) -> Result<()> {
+    if response.command_name() == expected {
+        Ok(())
     } else {
-        tmux_status(["attach-session", "-t", entry.session_id.as_str()])
-            .with_context(|| format!("attach to tmux session {}", entry.session_name))?;
+        unexpected_response(expected, response)
     }
-
-    Ok(())
 }
 
-fn tmux_output<const N: usize>(args: [&str; N]) -> Result<String> {
-    let output = Command::new("tmux")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("run tmux")?;
-
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+fn unexpected_response<T>(expected: &'static str, response: Response) -> Result<T> {
+    bail!(
+        "RMUX daemon sent `{}` response for `{expected}` request",
+        response.command_name()
+    )
 }
 
-fn tmux_status<const N: usize>(args: [&str; N]) -> Result<()> {
-    let output = Command::new("tmux")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("run tmux")?;
+fn rmux_socket_path() -> Result<PathBuf> {
+    rmux_client::resolve_socket_path(None, None).context("resolve RMUX socket path")
+}
 
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+fn rmux_endpoint() -> Result<RmuxEndpoint> {
+    #[cfg(unix)]
+    {
+        Ok(RmuxEndpoint::UnixSocket(rmux_socket_path()?))
     }
 
-    Ok(())
+    #[cfg(windows)]
+    {
+        Ok(RmuxEndpoint::WindowsPipe(
+            rmux_socket_path()?
+                .as_os_str()
+                .to_string_lossy()
+                .to_string(),
+        ))
+    }
+}
+
+async fn connect_rmux() -> Result<Rmux> {
+    Rmux::builder()
+        .endpoint(rmux_endpoint()?)
+        .connect_or_start()
+        .await
+        .context("connect to RMUX SDK daemon")
+}
+
+fn run_rmux<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create RMUX SDK runtime")?
+        .block_on(future)
+}
+
+fn rmux_session_name(value: &str) -> Result<SessionName> {
+    SessionName::new(value.to_string())
+        .map_err(|err| anyhow!("invalid RMUX session name `{value}`: {err}"))
+}
+
+fn parse_window_target(value: &str) -> Result<WindowTarget> {
+    match Target::parse(value)
+        .map_err(|err| anyhow!("invalid RMUX window target `{value}`: {err}"))?
+    {
+        Target::Window(target) => Ok(target),
+        _ => bail!("RMUX target `{value}` is not a window target"),
+    }
+}
+
+fn window_target_for_entry(entry: &Entry) -> Result<WindowTarget> {
+    Ok(WindowTarget::with_window(
+        rmux_session_name(&entry.session_name)?,
+        entry.window_index_num,
+    ))
+}
+
+fn window_target_string(entry: &Entry) -> String {
+    format!("{}:{}", entry.session_name, entry.window_index_num)
 }
 
 fn tail_non_empty(lines: &[String], count: usize) -> Vec<String> {
@@ -1325,7 +1579,7 @@ mod tests {
 
     #[test]
     fn window_lines_enables_all_windows_and_sets_line_counts() {
-        let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "10"]).unwrap();
+        let cli = Cli::try_parse_from(["rmux-jump", "--window-lines", "10"]).unwrap();
         let options = cli.options();
 
         assert!(options.all_windows);
@@ -1337,7 +1591,7 @@ mod tests {
     #[test]
     fn explicit_window_options_stay_independent_without_preset() {
         let cli = Cli::try_parse_from([
-            "tmux-jump",
+            "rmux-jump",
             "--all-windows",
             "--preview-lines",
             "12",
@@ -1356,7 +1610,7 @@ mod tests {
     #[test]
     fn refresh_seconds_can_disable_auto_refresh() {
         let cli = Cli::try_parse_from([
-            "tmux-jump",
+            "rmux-jump",
             "--window-lines",
             "10",
             "--refresh-seconds",
@@ -1381,7 +1635,7 @@ mod tests {
 
     #[test]
     fn window_lines_keeps_left_list_to_one_line_per_target() {
-        let cli = Cli::try_parse_from(["tmux-jump", "--window-lines", "10"]).unwrap();
+        let cli = Cli::try_parse_from(["rmux-jump", "--window-lines", "10"]).unwrap();
         let options = cli.options();
         let app = test_app_with_entries(&options, vec![test_entry("$0", "0", false)]);
         let entry = app.selected_entry().unwrap();
@@ -1446,10 +1700,7 @@ mod tests {
 
     #[test]
     fn initial_position_falls_back_to_active_window_when_id_missing() {
-        let entries = vec![
-            test_entry("$0", "0", false),
-            test_entry("$0", "1", true),
-        ];
+        let entries = vec![test_entry("$0", "0", false), test_entry("$0", "1", true)];
         let sessions = group_sessions(&entries);
         let current = CurrentTarget {
             session_id: Some("$0".to_string()),
@@ -1496,7 +1747,7 @@ mod tests {
         app.begin_rename_session();
         let rename = app.rename.as_ref().expect("rename started");
         assert_eq!(rename.kind, RenameKind::Session);
-        assert_eq!(rename.target_id, "$0");
+        assert_eq!(rename.target_id, "0");
         // session name for "$0" is "0", so buffer seeds with the current name.
         assert_eq!(rename.buffer, "0");
 
@@ -1523,8 +1774,7 @@ mod tests {
         app.begin_rename_window();
         let rename = app.rename.as_ref().expect("rename started");
         assert_eq!(rename.kind, RenameKind::Window);
-        // window_id for ("$0","1") is "@0-1"; original name is "window".
-        assert_eq!(rename.target_id, "@0-1");
+        assert_eq!(rename.target_id, "0:1");
         assert_eq!(rename.buffer, "window");
     }
 
@@ -1540,7 +1790,7 @@ mod tests {
         app.begin_kill_window();
         let kill = app.confirm_kill.as_ref().expect("kill pending");
         assert_eq!(kill.kind, KillKind::Window);
-        assert_eq!(kill.target_id, "@0-1");
+        assert_eq!(kill.target_id, "0:1");
         assert_eq!(kill.label, "1: window");
 
         app.cancel_kill();
@@ -1559,12 +1809,12 @@ mod tests {
         app.begin_kill_session();
         let kill = app.confirm_kill.as_ref().expect("kill pending");
         assert_eq!(kill.kind, KillKind::Session);
-        assert_eq!(kill.target_id, "$1");
+        assert_eq!(kill.target_id, "1");
         assert_eq!(kill.label, "1");
     }
 
     fn default_options() -> Options {
-        Cli::try_parse_from(["tmux-jump", "--window-lines", "10"])
+        Cli::try_parse_from(["rmux-jump", "--window-lines", "10"])
             .unwrap()
             .options()
     }
@@ -1588,16 +1838,20 @@ mod tests {
     }
 
     fn test_entry(session_id: &str, window_index: &str, window_active: bool) -> Entry {
+        let session_num = session_id.trim_start_matches('$');
+        let window_index_num = window_index.parse().unwrap();
         Entry {
             session_id: session_id.to_string(),
-            session_name: session_id.trim_start_matches('$').to_string(),
+            session_name: session_num.to_string(),
             session_attached: true,
             session_activity: 0,
-            window_id: format!("@{}-{}", session_id.trim_start_matches('$'), window_index),
+            window_id: format!("@{}-{}", session_num, window_index),
             window_index: window_index.to_string(),
+            window_index_num,
             window_name: "window".to_string(),
             window_active,
-            pane_id: format!("%{}-{}", session_id.trim_start_matches('$'), window_index),
+            pane_id: format!("%{}{}", session_num, window_index),
+            pane_id_num: window_index_num,
             pane_current_path: "/tmp".to_string(),
             preview: Vec::new(),
             activity: Activity::Unknown,

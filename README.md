@@ -1,18 +1,21 @@
-# tmux-jump
+# rmux-jump
 
-A small Rust TUI for jumping across tmux sessions or windows.
+A small Rust TUI for jumping across RMUX sessions or windows.
+
+It talks to the RMUX daemon through the Rust SDK and typed protocol requests,
+instead of scraping `rmux` CLI output.
 
 ## Usage
 
 ```sh
-cargo run --release -- --all-windows
+cargo run --release --bin rmux-jump -- --all-windows
 ```
 
 Controls:
 
 - `h` / `l` (or `←` / `→`, `Tab` / `Shift-Tab`): switch sessions across the top
 - `j` / `k` (or `↑` / `↓`): move through windows within the selected session (wraps around)
-- `Enter`: switch to the selected tmux window
+- `Enter`: switch to the selected RMUX window
 - `$`: rename the selected session (Enter saves, Esc cancels)
 - `,`: rename the selected window (Enter saves, Esc cancels)
 - `x`: kill the selected window (`y` confirms, `n` / `Esc` cancels)
@@ -20,7 +23,7 @@ Controls:
 - `r`: refresh now
 - `q` / `Esc`: quit
 
-The picker groups every tmux window under its session. The header shows the
+The picker groups every RMUX window under its session. The header shows the
 session strip with a cursor; pressing `l` jumps to the next session's active
 window. The picker refreshes preview output every 5 seconds while it is open.
 `--all-windows` only affects the `--list` printout (it makes `--list` enumerate
@@ -30,45 +33,57 @@ picker always shows the grouped view.
 Useful options:
 
 ```sh
-tmux-jump --preview-lines 12
-tmux-jump --window-lines 10
-tmux-jump --refresh-seconds 0
-tmux-jump --list --all-windows
+rmux-jump --preview-lines 12
+rmux-jump --window-lines 10
+rmux-jump --refresh-seconds 0
+rmux-jump --list --all-windows
 ```
 
-`--window-lines 10` is a shortcut for showing every tmux window with the last
-ten captured pane output lines in the right preview pane.
+`--window-lines 10` is a shortcut for showing every RMUX window with the last
+ten visible pane lines from the SDK snapshot in the right preview pane.
 Use `--refresh-seconds 0` to disable automatic refresh.
 
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --path . --bin rmux-jump --force
 ```
 
-## tmux binding
+## RMUX binding
 
-Put one of these in `~/.tmux.conf`.
+Put one of these in `~/.rmux.conf` or `~/.config/rmux/rmux.conf`, then run
+`rmux source-file ~/.rmux.conf`.
 
 Recommended shortcut:
 
 - `prefix + j` opens the all-window picker.
-- With tmux's default prefix, press `Control-B`, then `j`.
+- With RMUX's default prefix, press `Control-B`, then `j`.
 
 Prefix key session picker:
 
-```tmux
-bind-key j display-popup -E -w 90% -h 85% "tmux-jump"
+```rmux
+bind-key j display-popup -E -w 90% -h 85% "rmux-jump"
 ```
 
 Prefix key window picker:
 
-```tmux
-bind-key j display-popup -E -w 90% -h 85% "tmux-jump --window-lines 10"
+```rmux
+bind-key j display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
 ```
 
-No-prefix window picker on `Alt-j`:
+No-prefix window picker on `Ctrl-Space`:
 
-```tmux
-bind-key -n M-j display-popup -E -w 90% -h 85% "tmux-jump --window-lines 10"
+```rmux
+bind-key -n C-Space display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+bind-key -n C-@ display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+bind-key -n M-Space display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+```
+
+To apply the window picker immediately:
+
+```sh
+rmux bind-key j display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+rmux bind-key -n C-Space display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+rmux bind-key -n C-@ display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+rmux bind-key -n M-Space display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
 ```
