@@ -1255,9 +1255,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmux-client"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff613e7f4a53308f0a8f5e9cff37c7091c0c7101fabe6c3f559edce5f2fb70f4"
+checksum = "cfef589de029a6ff0c557badbf25d3cf6aec9bddbcaec533102be5ff921369a3"
 dependencies = [
  "libc",
  "rmux-core",
@@ -1274,9 +1274,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-core"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361c65a6300672addf9740891dca7f6ce1a459361828235d74fb9508472b3430"
+checksum = "b5dde1d3893d9d4644b012dd36ee80bb966bb57b7f2b016eac342c22a73410b7"
 dependencies = [
  "chrono",
  "compact_str 0.8.2",
@@ -1287,9 +1287,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-ipc"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "596769551a23e36d9cf30d3ea221c316c9e4ef6730d93aa28fb7377756e764ef"
+checksum = "8771b4a0193492ecf8b82a66088291656fcc4d133f4844736cc540cab643ce82"
 dependencies = [
  "libc",
  "rmux-os",
@@ -1315,9 +1315,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b81039619f4e264089e2e0ca2f49b099aa6d463b3d5e1d21ffbf50bba80e2ef1"
+checksum = "04610368a0c58e2b05bfdb28e24efc969a9e238519d319bd88e91e61e04ccd25"
 dependencies = [
  "libc",
  "rmux-types",
@@ -1327,9 +1327,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45f35d37b4571dbb826b10ea6d622e97a978527179d41781ee982d19cd8b2b02"
+checksum = "f3d69422fc536bc1250db0eb1e33d6e291c1ac3b1e5953326c127f1417cacaec"
 dependencies = [
  "bincode",
  "rmux-types",
@@ -1339,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-sdk"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3bf236a441a3fae922e092ead3d4320a839039bafe9fcc80721b6533b0879fc"
+checksum = "03b6f3efa0e11cd28cad454cad68f9d2b85f28ccd91118d0a16de56d8ef4667e"
 dependencies = [
  "libc",
  "rmux-ipc",
@@ -1357,9 +1357,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8dac2a179e871ec43601211e7d33cc9a88a8de6bc966fbea68d286c8ab37f53"
+checksum = "0c9b2e6cb80cf32aa51e70c60826c852a5d2d7e1575b739205552a8d398fd614"
 dependencies = [
  "serde",
 ]

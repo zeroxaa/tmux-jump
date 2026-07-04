@@ -13,8 +13,8 @@ cargo run --release --bin rmux-jump -- --all-windows
 
 Controls:
 
-- `h` / `l` (or `←` / `→`, `Tab` / `Shift-Tab`): switch sessions across the top
-- `j` / `k` (or `↑` / `↓`): move through windows within the selected session (wraps around)
+- `j` / `k` (or `↑` / `↓`): move through every window of every session in one flat list (wraps around)
+- `h` / `l` (or `←` / `→`, `Tab` / `Shift-Tab`): jump to the previous / next session
 - `Enter`: switch to the selected RMUX window
 - `$`: rename the selected session (Enter saves, Esc cancels)
 - `,`: rename the selected window (Enter saves, Esc cancels)
@@ -23,9 +23,11 @@ Controls:
 - `r`: refresh now
 - `q` / `Esc`: quit
 
-The picker groups every RMUX window under its session. The header shows the
-session strip with a cursor; pressing `l` jumps to the next session's active
-window. The picker refreshes preview output every 5 seconds while it is open.
+The picker lists every RMUX window in one vertical list, grouped under a header
+for each session. `j` / `k` walk through the whole list (crossing session
+boundaries and wrapping at the ends), while `h` / `l` jump straight to the
+previous / next session's active window. The picker refreshes preview output
+every 5 seconds while it is open.
 `--all-windows` only affects the `--list` printout (it makes `--list` enumerate
 every window instead of just each session's active window); the interactive
 picker always shows the grouped view.
@@ -42,6 +44,8 @@ rmux-jump --list --all-windows
 `--window-lines 10` is a shortcut for showing every RMUX window with the last
 ten visible pane lines from the SDK snapshot in the right preview pane.
 Use `--refresh-seconds 0` to disable automatic refresh.
+When a pane's current directory is inside a Git worktree, `rmux-jump` shows a
+compact worktree summary in the list and full Git details in the preview pane.
 
 ## Install
 

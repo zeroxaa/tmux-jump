@@ -5,6 +5,7 @@ use std::{
     future::Future,
     io::{self, Stdout},
     path::PathBuf,
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
@@ -114,7 +115,6 @@ struct Entry {
     session_id: String,
     session_name: String,
     session_attached: bool,
-    session_activity: u64,
     window_id: String,
     window_index: String,
     window_index_num: u32,
@@ -123,9 +123,82 @@ struct Entry {
     pane_id: String,
     pane_id_num: u32,
     pane_current_path: String,
+    worktree_info: Option<GitWorktreeInfo>,
     preview: Vec<String>,
     activity: Activity,
     activity_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitWorktreeInfo {
+    kind: GitWorktreeKind,
+    top_level: String,
+    git_dir: String,
+    common_dir: String,
+    head: Option<String>,
+    branch: Option<String>,
+    upstream: Option<String>,
+    status_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitWorktreeKind {
+    Main,
+    Linked,
+}
+
+impl GitWorktreeInfo {
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            GitWorktreeKind::Main => "main",
+            GitWorktreeKind::Linked => "linked",
+        }
+    }
+
+    fn ref_label(&self) -> String {
+        if let Some(branch) = self.branch.as_deref().filter(|branch| !branch.is_empty()) {
+            return branch.to_string();
+        }
+        self.head
+            .as_deref()
+            .map(|head| format!("detached {}", short_hash(head)))
+            .unwrap_or_else(|| "no HEAD".to_string())
+    }
+
+    fn change_count(&self) -> usize {
+        self.status_lines
+            .iter()
+            .filter(|line| !line.starts_with("##"))
+            .count()
+    }
+
+    fn status_label(&self) -> String {
+        match self.change_count() {
+            0 => "clean".to_string(),
+            1 => "1 change".to_string(),
+            n => format!("{n} changes"),
+        }
+    }
+
+    fn compact_summary(&self) -> String {
+        let mut parts = vec![self.ref_label()];
+        if self.kind == GitWorktreeKind::Linked {
+            parts.push("linked".to_string());
+        }
+        parts.push(self.status_label());
+        parts.join(" · ")
+    }
+
+    /// Tightest possible label for inline rendering in the picker's left list:
+    /// just the branch (or detached/no-HEAD label), plus `+N` when there are
+    /// uncommitted changes. Full status + linked marker live in the preview.
+    fn inline_label(&self) -> String {
+        let r = self.ref_label();
+        match self.change_count() {
+            0 => r,
+            n => format!("{r} +{n}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -150,7 +223,6 @@ struct SessionGroup {
     id: String,
     name: String,
     attached: bool,
-    activity: u64,
     /// Indices into `App::entries`, sorted by RMUX window index ascending.
     window_indices: Vec<usize>,
 }
@@ -197,6 +269,7 @@ struct App {
     current: CurrentTarget,
     status: Option<String>,
     probe: Option<Receiver<ActivityProbeResult>>,
+    worktree_probe: Option<Receiver<WorktreeProbeResult>>,
     rename: Option<RenameState>,
     confirm_kill: Option<KillState>,
 }
@@ -206,6 +279,7 @@ impl App {
         let current = current_target();
         let entries = load_entries(true, options.preview_lines)?;
         let probe = spawn_activity_probe(&entries, &options);
+        let worktree_probe = spawn_worktree_probe(&entries);
         let sessions = group_sessions(&entries);
         let (selected_session, selected_window) = initial_position(&sessions, &entries, &current);
         Ok(Self {
@@ -219,6 +293,7 @@ impl App {
             current,
             status: None,
             probe,
+            worktree_probe,
             rename: None,
             confirm_kill: None,
         })
@@ -252,6 +327,30 @@ impl App {
         }
     }
 
+    /// Drain any completed background git-worktree probe and fan its
+    /// path-keyed results into every entry whose pane lives at that path.
+    fn poll_worktree_probe(&mut self) -> bool {
+        let Some(rx) = &self.worktree_probe else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                for entry in &mut self.entries {
+                    if let Some(info) = result.by_path.get(&entry.pane_current_path) {
+                        entry.worktree_info = info.clone();
+                    }
+                }
+                self.worktree_probe = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.worktree_probe = None;
+                false
+            }
+        }
+    }
+
     fn refresh(&mut self) {
         self.refresh_with_status("refreshed");
     }
@@ -261,9 +360,10 @@ impl App {
     }
 
     fn refresh_with_status(&mut self, status: &str) {
-        // Discard any in-flight startup probe — refresh data is fresher and the
-        // probe's fingerprints would clobber the post-refresh state.
+        // Discard any in-flight startup probes — refresh data is fresher and
+        // the probes' results would clobber the post-refresh state.
         self.probe = None;
+        self.worktree_probe = None;
         let prev_session_id = self
             .sessions
             .get(self.selected_session)
@@ -274,11 +374,24 @@ impl App {
             .iter()
             .map(|e| (e.pane_id.clone(), e.activity_fingerprint.clone()))
             .collect();
+        // Keep the previous git info per path so the list doesn't flash blank
+        // while the new probe runs; the probe will overwrite each entry shortly.
+        let prev_worktree: HashMap<String, Option<GitWorktreeInfo>> = self
+            .entries
+            .iter()
+            .map(|e| (e.pane_current_path.clone(), e.worktree_info.clone()))
+            .collect();
 
         match load_entries(true, self.preview_lines) {
             Ok(mut entries) => {
                 apply_activity(&mut entries, &prev_fingerprints);
+                for entry in &mut entries {
+                    if let Some(info) = prev_worktree.get(&entry.pane_current_path) {
+                        entry.worktree_info = info.clone();
+                    }
+                }
                 let sessions = group_sessions(&entries);
+                self.worktree_probe = spawn_worktree_probe(&entries);
                 self.entries = entries;
                 self.sessions = sessions;
                 self.selected_session = prev_session_id
@@ -312,26 +425,49 @@ impl App {
         self.sessions.get(self.selected_session)
     }
 
+    /// Advance to the next window in the flat list, flowing into the next
+    /// session at a session boundary and wrapping around at the very end.
     fn next_window(&mut self) {
         let Some(session) = self.current_session() else {
             return;
         };
-        let len = session.window_indices.len();
-        if len == 0 {
+        if self.selected_window + 1 < session.window_indices.len() {
+            self.selected_window += 1;
             return;
         }
-        self.selected_window = (self.selected_window + 1) % len;
+        let n = self.sessions.len();
+        let mut si = self.selected_session;
+        for _ in 0..n {
+            si = (si + 1) % n;
+            if !self.sessions[si].window_indices.is_empty() {
+                self.selected_session = si;
+                self.selected_window = 0;
+                return;
+            }
+        }
     }
 
+    /// Step to the previous window in the flat list, flowing into the previous
+    /// session's last window at a boundary and wrapping around at the top.
     fn previous_window(&mut self) {
-        let Some(session) = self.current_session() else {
-            return;
-        };
-        let len = session.window_indices.len();
-        if len == 0 {
+        if self.current_session().is_none() {
             return;
         }
-        self.selected_window = (self.selected_window + len - 1) % len;
+        if self.selected_window > 0 {
+            self.selected_window -= 1;
+            return;
+        }
+        let n = self.sessions.len();
+        let mut si = self.selected_session;
+        for _ in 0..n {
+            si = (si + n - 1) % n;
+            let len = self.sessions[si].window_indices.len();
+            if len > 0 {
+                self.selected_session = si;
+                self.selected_window = len - 1;
+                return;
+            }
+        }
     }
 
     fn next_session(&mut self) {
@@ -491,7 +627,6 @@ fn group_sessions(entries: &[Entry]) -> Vec<SessionGroup> {
                 id: entry.session_id.clone(),
                 name: entry.session_name.clone(),
                 attached: entry.session_attached,
-                activity: entry.session_activity,
                 window_indices: Vec::new(),
             });
         group.window_indices.push(i);
@@ -503,12 +638,9 @@ fn group_sessions(entries: &[Entry]) -> Vec<SessionGroup> {
             .window_indices
             .sort_by_key(|&i| entries[i].window_index.parse::<u32>().unwrap_or(u32::MAX));
     }
-    sessions.sort_by(|a, b| {
-        b.attached
-            .cmp(&a.attached)
-            .then(b.activity.cmp(&a.activity))
-            .then(a.name.cmp(&b.name))
-    });
+    // Stable, predictable order: sort by session name only, so a session keeps
+    // its position regardless of attach state or recent activity.
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
     sessions
 }
 
@@ -599,26 +731,47 @@ fn main() -> Result<()> {
 }
 
 fn print_targets(options: &Options) -> Result<()> {
-    let entries = load_entries(options.all_windows, options.preview_lines)?;
+    let mut entries = load_entries(options.all_windows, options.preview_lines)?;
+    // `--list` has no event loop to poll the worktree probe in the background,
+    // so block on it once before printing to keep the worktree column populated.
+    if let Some(rx) = spawn_worktree_probe(&entries)
+        && let Ok(result) = rx.recv()
+    {
+        for entry in &mut entries {
+            if let Some(info) = result.by_path.get(&entry.pane_current_path) {
+                entry.worktree_info = info.clone();
+            }
+        }
+    }
     for entry in entries {
         let lines = tail_non_empty(&entry.preview, cmp::max(options.inline_lines, 1));
+        let worktree = entry
+            .worktree_info
+            .as_ref()
+            .map(|info| info.compact_summary())
+            .unwrap_or_default();
         if options.inline_lines <= 1 {
             let last_line = lines
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "<no output>".to_string());
             println!(
+                "{}\t{}:{}\t{}\t{}\t{}",
+                entry.session_name,
+                entry.window_index,
+                entry.window_name,
+                entry.pane_current_path,
+                worktree,
+                last_line
+            );
+        } else {
+            println!(
                 "{}\t{}:{}\t{}\t{}",
                 entry.session_name,
                 entry.window_index,
                 entry.window_name,
                 entry.pane_current_path,
-                last_line
-            );
-        } else {
-            println!(
-                "{}\t{}:{}\t{}",
-                entry.session_name, entry.window_index, entry.window_name, entry.pane_current_path
+                worktree
             );
             if lines.is_empty() {
                 println!("  <no output>");
@@ -640,6 +793,7 @@ fn run_picker(options: &Options) -> Result<Option<Entry>> {
 
     loop {
         app.poll_probe();
+        app.poll_worktree_probe();
         tui.draw(&app)?;
 
         if event::poll(poll_timeout(refresh_interval, last_refresh))
@@ -764,14 +918,14 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(4),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
         .split(area);
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vertical[1]);
 
     render_header(frame, vertical[0], app);
@@ -804,32 +958,6 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(current_session, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let mut strip: Vec<Span> = vec![Span::styled(
-        "Sessions ",
-        Style::default().fg(Color::DarkGray),
-    )];
-    for (idx, session) in app.sessions.iter().enumerate() {
-        let is_selected = idx == app.selected_session;
-        let is_current = app.current.session_id.as_deref() == Some(session.id.as_str());
-
-        let mut style = Style::default();
-        if is_selected {
-            style = style
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD);
-        } else if is_current {
-            style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
-        } else if session.attached {
-            style = style.fg(Color::Green);
-        }
-
-        let marker = if is_current { "*" } else { "" };
-        strip.push(Span::styled(format!(" {}{} ", session.name, marker), style));
-        strip.push(Span::raw(" "));
-    }
-    let sessions_line = Line::from(strip);
-
     let refresh = if app.refresh_seconds == 0 {
         "auto off".to_string()
     } else {
@@ -837,43 +965,46 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let help = Line::from(Span::styled(
         format!(
-            "h/l session  j/k window  enter switch  $/, rename ses/win  X/x kill ses/win  r refresh  q/esc quit  ·  {refresh}"
+            "j/k window  h/l jump session  enter switch  $/, rename ses/win  X/x kill ses/win  r refresh  q/esc quit  ·  {refresh}"
         ),
         Style::default().fg(Color::DarkGray),
     ));
 
-    let paragraph = Paragraph::new(vec![title, sessions_line, help])
-        .block(Block::default().borders(Borders::ALL));
+    let paragraph = Paragraph::new(vec![title, help]).block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = match app.current_session() {
-        Some(session) => format!(
-            "{} · {} window{}{}",
-            session.name,
-            session.window_indices.len(),
-            if session.window_indices.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-            if session.attached { " · attached" } else { "" },
-        ),
-        None => "Windows".to_string(),
-    };
+    let session_count = app.sessions.len();
+    let window_count: usize = app.sessions.iter().map(|s| s.window_indices.len()).sum();
+    let title = format!(
+        "{session_count} session{} · {window_count} window{}",
+        if session_count == 1 { "" } else { "s" },
+        if window_count == 1 { "" } else { "s" },
+    );
 
-    let items: Vec<ListItem> = match app.current_session() {
-        Some(session) => session
-            .window_indices
-            .iter()
-            .map(|&i| ListItem::new(window_item_lines(&app.entries[i], app)))
-            .collect(),
-        None => Vec::new(),
-    };
+    // One flat list grouped by session: a header per session, then its windows.
+    // `selected_row` is the list index of the currently selected window so the
+    // highlight lands on it and the view scrolls to keep it visible.
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected_row = 0usize;
+    for (si, session) in app.sessions.iter().enumerate() {
+        items.push(session_header_item(
+            session,
+            si == app.selected_session,
+            &app.current,
+        ));
+        for (wi, &ei) in session.window_indices.iter().enumerate() {
+            if si == app.selected_session && wi == app.selected_window {
+                selected_row = items.len();
+            }
+            items.push(ListItem::new(window_item_lines(&app.entries[ei], app)));
+        }
+    }
+
     let mut state = ListState::default();
     if !items.is_empty() {
-        state.select(Some(app.selected_window));
+        state.select(Some(selected_row));
     }
 
     let list = List::new(items)
@@ -888,25 +1019,38 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// A non-selectable group header row for a session in the flat list.
+fn session_header_item<'a>(
+    session: &'a SessionGroup,
+    is_selected: bool,
+    current: &CurrentTarget,
+) -> ListItem<'a> {
+    let is_current = current.session_id.as_deref() == Some(session.id.as_str());
+    let count = session.window_indices.len();
+
+    let mut style = Style::default().add_modifier(Modifier::BOLD);
+    style = if is_current || session.attached {
+        style.fg(Color::Green)
+    } else {
+        style.fg(Color::Magenta)
+    };
+
+    let pointer = if is_selected { "▾ " } else { "  " };
+    let marker = if is_current { " *" } else { "" };
+    Line::from(vec![
+        Span::styled(pointer, Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{}{}", session.name, marker), style),
+        Span::styled(
+            format!("  ({count} window{})", if count == 1 { "" } else { "s" }),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+    .into()
+}
+
 fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     let current = is_current(entry, &app.current);
     let active_output = entry.activity == Activity::Active;
-
-    let mut flags = Vec::new();
-    if current {
-        flags.push("here");
-    }
-    if active_output {
-        flags.push("running");
-    }
-    if entry.window_active {
-        flags.push("focused");
-    }
-    let flags = if flags.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", flags.join(","))
-    };
 
     let current_marker = if current {
         Span::styled(
@@ -928,6 +1072,16 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     } else {
         Span::raw(" ")
     };
+    let focused_marker = if entry.window_active {
+        Span::styled(
+            "◆",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(" ")
+    };
 
     let name_style = if current {
         Style::default()
@@ -941,10 +1095,12 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         Style::default().add_modifier(Modifier::BOLD)
     };
 
-    let mut lines = vec![Line::from(vec![
+    let mut row_spans = vec![
         current_marker,
         Span::raw(" "),
         activity_marker,
+        Span::raw(" "),
+        focused_marker,
         Span::raw(" "),
         Span::styled(
             format!("{:>3}: ", entry.window_index),
@@ -952,8 +1108,15 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
         ),
         Span::styled(entry.window_name.clone(), name_style),
         Span::raw(format!("  {}", entry.pane_current_path)),
-        Span::styled(flags, Style::default().fg(Color::Yellow)),
-    ])];
+    ];
+    if let Some(worktree_info) = &entry.worktree_info {
+        row_spans.push(Span::styled("  · ", Style::default().fg(Color::DarkGray)));
+        row_spans.push(Span::styled(
+            worktree_info.inline_label(),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+    let mut lines = vec![Line::from(row_spans)];
 
     for line in tail_non_empty(&entry.preview, app.inline_lines) {
         lines.push(Line::from(Span::styled(
@@ -963,6 +1126,53 @@ fn window_item_lines<'a>(entry: &'a Entry, app: &App) -> Vec<Line<'a>> {
     }
 
     lines
+}
+
+fn worktree_detail_lines(info: &GitWorktreeInfo) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        labeled_line(
+            "git",
+            format!(
+                "{} worktree · {} · {}",
+                info.kind_label(),
+                info.ref_label(),
+                info.status_label()
+            ),
+        ),
+        labeled_line("root", info.top_level.clone()),
+        labeled_line("git dir", info.git_dir.clone()),
+        labeled_line("common dir", info.common_dir.clone()),
+    ];
+    if let Some(head) = &info.head {
+        lines.push(labeled_line("head", head.clone()));
+    }
+    if let Some(branch) = &info.branch {
+        lines.push(labeled_line("branch", branch.clone()));
+    }
+    if let Some(upstream) = &info.upstream {
+        lines.push(labeled_line("upstream", upstream.clone()));
+    }
+    if info.status_lines.is_empty() {
+        lines.push(labeled_line("status", "clean"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "status",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.extend(
+            info.status_lines
+                .iter()
+                .map(|line| Line::from(Span::raw(format!("  {line}")))),
+        );
+    }
+    lines
+}
+
+fn labeled_line(label: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label} "), Style::default().fg(Color::DarkGray)),
+        Span::raw(value.into()),
+    ])
 }
 
 fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -985,8 +1195,12 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Span::styled("  path ", Style::default().fg(Color::DarkGray)),
                     Span::raw(entry.pane_current_path.clone()),
                 ]),
-                Line::raw(""),
             ];
+            if let Some(worktree_info) = &entry.worktree_info {
+                lines.push(Line::raw(""));
+                lines.extend(worktree_detail_lines(worktree_info));
+            }
+            lines.push(Line::raw(""));
             lines.extend(entry.preview.iter().map(|line| Line::raw(line.clone())));
             lines
         }
@@ -1116,11 +1330,12 @@ async fn load_entries_async(all_windows: bool, preview_lines: usize) -> Result<V
             Err(err) => vec![format!("failed to capture pane: {err:#}")],
         };
         let activity_fingerprint = activity_fingerprint_of(&preview);
+        // `worktree_info` is filled in asynchronously by `spawn_worktree_probe`
+        // so the picker can draw immediately instead of waiting on git.
         entries.push(Entry {
             session_id: pane.session_id.to_string(),
             session_name,
             session_attached: session_info.is_some_and(|info| info.attached_clients > 0),
-            session_activity: session_info.map(|info| info.generation).unwrap_or_default(),
             window_id: window.id.clone(),
             window_index: pane.window_index.to_string(),
             window_index_num: pane.window_index,
@@ -1129,6 +1344,7 @@ async fn load_entries_async(all_windows: bool, preview_lines: usize) -> Result<V
             pane_id: pane.pane_id.to_string(),
             pane_id_num: pane.pane_id.as_u32(),
             pane_current_path: pane.working_directory.unwrap_or_else(|| "-".to_string()),
+            worktree_info: None,
             preview,
             activity: Activity::Unknown,
             activity_fingerprint,
@@ -1181,6 +1397,80 @@ async fn load_window_runtime_info(
     }
 
     Ok(windows)
+}
+
+fn git_worktree_info(path: &str) -> Option<GitWorktreeInfo> {
+    if git_output(path, &["rev-parse", "--is-inside-work-tree"]).ok()? != "true" {
+        return None;
+    }
+
+    let top_level = git_output(path, &["rev-parse", "--show-toplevel"]).ok()?;
+    let git_dir = git_output(path, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    let common_dir = git_output(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|_| git_output(path, &["rev-parse", "--git-common-dir"]))
+    .ok()?;
+    let kind = if git_dir == common_dir {
+        GitWorktreeKind::Main
+    } else {
+        GitWorktreeKind::Linked
+    };
+    let head = git_output(path, &["rev-parse", "--verify", "HEAD"])
+        .ok()
+        .filter(|head| !head.is_empty());
+    let branch = git_output(path, &["branch", "--show-current"])
+        .ok()
+        .filter(|branch| !branch.is_empty());
+    let upstream = git_output(
+        path,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()
+    .filter(|upstream| !upstream.is_empty());
+    let status_lines = git_output(path, &["status", "--short", "--branch"])
+        .map(|output| output.lines().map(ToString::to_string).collect())
+        .unwrap_or_default();
+
+    Some(GitWorktreeInfo {
+        kind,
+        top_level,
+        git_dir,
+        common_dir,
+        head,
+        branch,
+        upstream,
+        status_lines,
+    })
+}
+
+fn git_output(path: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("run git -C {path} {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 fn current_target() -> CurrentTarget {
@@ -1354,6 +1644,44 @@ fn spawn_activity_probe(
     Some(rx)
 }
 
+struct WorktreeProbeResult {
+    /// `git_worktree_info` keyed by pane current path. `None` value means the
+    /// path is not inside a git worktree (still a recorded answer, so we don't
+    /// keep re-probing it on every refresh).
+    by_path: HashMap<String, Option<GitWorktreeInfo>>,
+}
+
+/// Spawn a background thread that runs `git_worktree_info` once per unique
+/// pane path and sends the path-keyed results over a channel. Returns `None`
+/// when there is nothing to probe.
+///
+/// Running off-thread matters because `git_worktree_info` forks ~8 git
+/// processes per path; doing this synchronously in `load_entries` used to
+/// noticeably delay the first frame.
+fn spawn_worktree_probe(entries: &[Entry]) -> Option<Receiver<WorktreeProbeResult>> {
+    let mut paths: Vec<String> = entries
+        .iter()
+        .map(|e| e.pane_current_path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return None;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut by_path = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let info = git_worktree_info(&path);
+            by_path.insert(path, info);
+        }
+        let _ = tx.send(WorktreeProbeResult { by_path });
+    });
+
+    Some(rx)
+}
+
 fn switch_to(entry: &Entry) -> Result<()> {
     let target = window_target_for_entry(entry)?;
     expect_response(
@@ -1373,18 +1701,20 @@ fn switch_to(entry: &Entry) -> Result<()> {
     }
 
     expect_response(
-        rmux_roundtrip(Request::SwitchClientExt3(SwitchClientExt3Request {
-            target_client: None,
-            target: Some(window_target_string(entry)),
-            key_table: None,
-            last_session: false,
-            next_session: false,
-            previous_session: false,
-            toggle_read_only: false,
-            sort_order: None,
-            skip_environment_update: false,
-            zoom: false,
-        }))?,
+        rmux_roundtrip(Request::SwitchClientExt3(Box::new(
+            SwitchClientExt3Request {
+                target_client: None,
+                target: Some(window_target_string(entry)),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                sort_order: None,
+                skip_environment_update: false,
+                zoom: false,
+            },
+        )))?,
         "switch-client",
     )
 }
@@ -1644,6 +1974,91 @@ mod tests {
     }
 
     #[test]
+    fn window_item_uses_front_markers_instead_of_trailing_status_text() {
+        let options = default_options();
+        let mut entry = test_entry("$0", "0", true);
+        entry.pane_current_path =
+            "/very/long/path/that/should/not/hide/window/status/markers".to_string();
+        entry.activity = Activity::Active;
+        let mut app = test_app_with_entries(&options, vec![entry]);
+        app.current = CurrentTarget {
+            session_id: Some("$0".to_string()),
+            window_id: Some(app.entries[0].window_id.clone()),
+        };
+
+        let row: String = window_item_lines(&app.entries[0], &app)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(row.starts_with("● ▸ ◆"));
+        assert!(!row.contains("here"));
+        assert!(!row.contains("running"));
+        assert!(!row.contains("focused"));
+    }
+
+    #[test]
+    fn worktree_summary_omits_main_worktree_label() {
+        let mut info = test_worktree_info();
+        info.kind = GitWorktreeKind::Main;
+
+        assert_eq!(info.compact_summary(), "feature · 2 changes");
+    }
+
+    #[test]
+    fn worktree_summary_marks_linked_worktrees() {
+        let info = test_worktree_info();
+
+        assert_eq!(info.compact_summary(), "feature · linked · 2 changes");
+    }
+
+    #[test]
+    fn window_item_appends_worktree_label_inline() {
+        let options = default_options();
+        let mut entry = test_entry("$0", "0", true);
+        entry.worktree_info = Some(test_worktree_info());
+        let app = test_app_with_entries(&options, vec![entry]);
+        let lines = window_item_lines(&app.entries[0], &app);
+
+        let row: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        // Single row, no separate "git: …" line. The inline label drops the
+        // "git:" prefix and the "linked" / "clean" filler — just branch + count.
+        assert_eq!(lines.len(), 1);
+        assert!(!row.contains("git:"));
+        assert!(row.contains("· feature +2"));
+    }
+
+    #[test]
+    fn worktree_detail_lines_show_git_paths_and_status() {
+        let info = test_worktree_info();
+        let rendered: Vec<String> = worktree_detail_lines(&info)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("linked worktree")));
+        assert!(rendered.iter().any(|line| line == "root /repo"));
+        assert!(rendered.iter().any(|line| line == "common dir /repo/.git"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "upstream origin/feature")
+        );
+        assert!(rendered.iter().any(|line| line == "  ?? README.md"));
+    }
+
+    #[test]
     fn tail_non_empty_returns_last_non_empty_lines() {
         let lines = vec![
             "first".to_string(),
@@ -1657,6 +2072,19 @@ mod tests {
             tail_non_empty(&lines, 2),
             vec!["second".to_string(), "third".to_string()]
         );
+    }
+
+    #[test]
+    fn sessions_sort_by_name_ignoring_attach_state() {
+        // "1" is the attached session; "0" is detached. Name still decides the
+        // order, so a session keeps its position no matter what is attached.
+        let mut entries = vec![test_entry("$1", "0", true), test_entry("$0", "0", true)];
+        entries[0].session_attached = true;
+        entries[1].session_attached = false;
+
+        let sessions = group_sessions(&entries);
+        assert_eq!(sessions[0].name, "0");
+        assert_eq!(sessions[1].name, "1");
     }
 
     #[test]
@@ -1675,6 +2103,41 @@ mod tests {
         // From the last window, `j` wraps back to the first.
         app.next_window();
         assert_eq!(app.selected_window, 0);
+    }
+
+    #[test]
+    fn window_navigation_flows_across_sessions() {
+        let options = default_options();
+        // $0 has two windows, $1 has one. Sorted by name, $0 precedes $1.
+        let mut app = test_app_with_entries(
+            &options,
+            vec![
+                test_entry("$0", "0", true),
+                test_entry("$0", "1", false),
+                test_entry("$1", "0", true),
+            ],
+        );
+        app.selected_session = 0;
+        app.selected_window = 0;
+
+        app.next_window();
+        assert_eq!((app.selected_session, app.selected_window), (0, 1));
+
+        // At the end of $0's windows, `j` flows into $1.
+        app.next_window();
+        assert_eq!((app.selected_session, app.selected_window), (1, 0));
+
+        // At the very last window, `j` wraps to the very first.
+        app.next_window();
+        assert_eq!((app.selected_session, app.selected_window), (0, 0));
+
+        // `k` from the very first wraps to the very last window of the last session.
+        app.previous_window();
+        assert_eq!((app.selected_session, app.selected_window), (1, 0));
+
+        // `k` flows back into the previous session's last window.
+        app.previous_window();
+        assert_eq!((app.selected_session, app.selected_window), (0, 1));
     }
 
     #[test]
@@ -1832,6 +2295,7 @@ mod tests {
             current: CurrentTarget::default(),
             status: None,
             probe: None,
+            worktree_probe: None,
             rename: None,
             confirm_kill: None,
         }
@@ -1844,7 +2308,6 @@ mod tests {
             session_id: session_id.to_string(),
             session_name: session_num.to_string(),
             session_attached: true,
-            session_activity: 0,
             window_id: format!("@{}-{}", session_num, window_index),
             window_index: window_index.to_string(),
             window_index_num,
@@ -1853,9 +2316,27 @@ mod tests {
             pane_id: format!("%{}{}", session_num, window_index),
             pane_id_num: window_index_num,
             pane_current_path: "/tmp".to_string(),
+            worktree_info: None,
             preview: Vec::new(),
             activity: Activity::Unknown,
             activity_fingerprint: String::new(),
+        }
+    }
+
+    fn test_worktree_info() -> GitWorktreeInfo {
+        GitWorktreeInfo {
+            kind: GitWorktreeKind::Linked,
+            top_level: "/repo".to_string(),
+            git_dir: "/repo/.git/worktrees/feature".to_string(),
+            common_dir: "/repo/.git".to_string(),
+            head: Some("1234567890abcdef".to_string()),
+            branch: Some("feature".to_string()),
+            upstream: Some("origin/feature".to_string()),
+            status_lines: vec![
+                "## feature...origin/feature".to_string(),
+                " M src/main.rs".to_string(),
+                "?? README.md".to_string(),
+            ],
         }
     }
 
