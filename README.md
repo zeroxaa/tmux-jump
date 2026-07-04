@@ -1,14 +1,17 @@
-# rmux-jump
+# jump
 
-A small Rust TUI for jumping across RMUX sessions or windows.
+A small Rust TUI for jumping across multiplexer sessions or windows.
 
-It talks to the RMUX daemon through the Rust SDK and typed protocol requests,
-instead of scraping `rmux` CLI output.
+This repo builds two backend-specific binaries:
+
+- `rmux-jump`: talks to the RMUX daemon through the Rust SDK and typed protocol requests.
+- `tmux-jump`: talks to tmux through the tmux CLI.
 
 ## Usage
 
 ```sh
 cargo run --release --bin rmux-jump -- --all-windows
+cargo run --release --bin tmux-jump -- --all-windows
 ```
 
 Controls:
@@ -50,7 +53,7 @@ compact worktree summary in the list and full Git details in the preview pane.
 ## Install
 
 ```sh
-cargo install --path . --bin rmux-jump --force
+cargo install --path . --bins --force
 ```
 
 ## RMUX binding
@@ -90,4 +93,14 @@ rmux bind-key j display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
 rmux bind-key -n C-Space display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
 rmux bind-key -n C-@ display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
 rmux bind-key -n M-Space display-popup -E -w 90% -h 85% "rmux-jump --window-lines 10"
+```
+
+## tmux binding
+
+Put one of these in `~/.tmux.conf` or `~/.config/tmux/tmux.conf`, then run
+`tmux source-file ~/.tmux.conf`.
+
+```tmux
+bind-key j display-popup -E -w 90% -h 85% "tmux-jump --window-lines 10"
+bind-key -n C-Space display-popup -E -w 90% -h 85% "tmux-jump --window-lines 10"
 ```
