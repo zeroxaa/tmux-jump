@@ -37,6 +37,7 @@ use rmux_sdk::{PaneId, Rmux, RmuxEndpoint};
 
 const SEP: char = '\u{241F}';
 const CURRENT_FORMAT: &str = "#{session_id}\u{241F}#{window_id}";
+const CURRENT_CLIENT_FORMAT: &str = "#{client_tty}";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Fast RMUX session/window picker")]
@@ -1490,6 +1491,14 @@ fn current_target() -> CurrentTarget {
     }
 }
 
+fn current_client_tty() -> Result<String> {
+    let tty = display_message(CURRENT_CLIENT_FORMAT)?.trim().to_string();
+    if tty.is_empty() {
+        bail!("RMUX display-message returned no client tty");
+    }
+    Ok(tty)
+}
+
 async fn capture_preview_from_pane(pane: &rmux_sdk::Pane, lines: usize) -> Result<Vec<String>> {
     let capture = pane
         .screenshot()
@@ -1700,23 +1709,28 @@ fn switch_to(entry: &Entry) -> Result<()> {
         bail!("run inside RMUX to switch clients");
     }
 
+    let client_tty = current_client_tty()?;
     expect_response(
-        rmux_roundtrip(Request::SwitchClientExt3(Box::new(
-            SwitchClientExt3Request {
-                target_client: None,
-                target: Some(window_target_string(entry)),
-                key_table: None,
-                last_session: false,
-                next_session: false,
-                previous_session: false,
-                toggle_read_only: false,
-                sort_order: None,
-                skip_environment_update: false,
-                zoom: false,
-            },
-        )))?,
+        rmux_roundtrip(Request::SwitchClientExt3(Box::new(switch_client_request(
+            entry, client_tty,
+        ))))?,
         "switch-client",
     )
+}
+
+fn switch_client_request(entry: &Entry, client_tty: String) -> SwitchClientExt3Request {
+    SwitchClientExt3Request {
+        target_client: Some(client_tty),
+        target: Some(entry.session_name.clone()),
+        key_table: None,
+        last_session: false,
+        next_session: false,
+        previous_session: false,
+        toggle_read_only: false,
+        sort_order: None,
+        skip_environment_update: false,
+        zoom: false,
+    }
 }
 
 fn rename_session(target: &str, new_name: &str) -> Result<()> {
@@ -2274,6 +2288,15 @@ mod tests {
         assert_eq!(kill.kind, KillKind::Session);
         assert_eq!(kill.target_id, "1");
         assert_eq!(kill.label, "1");
+    }
+
+    #[test]
+    fn switch_client_targets_current_client_and_session_name() {
+        let entry = test_entry("$1", "3", true);
+        let request = switch_client_request(&entry, "/dev/ttys027".to_string());
+
+        assert_eq!(request.target_client.as_deref(), Some("/dev/ttys027"));
+        assert_eq!(request.target.as_deref(), Some("1"));
     }
 
     fn default_options() -> Options {
